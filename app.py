@@ -7,7 +7,7 @@ CORS(app)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 SQLITE_PATH = os.getenv("SQLITE_PATH", "/tmp/toolmowis.db")
-PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "https://taolavh09-1.onrender.com").rstrip("/")
+PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "https://taolavh09-2.onrender.com").rstrip("/")
 
 DEFAULT_PRICING = {
     "plans": {
@@ -237,6 +237,38 @@ def accounts():
     return jsonify({"accounts":arr})
 
 
+@app.get("/my-account")
+def my_account():
+    """Return the authoritative server-side account + assigned key data."""
+    aid = str(request.args.get("id", "")).strip()
+    if not aid:
+        return jsonify({"ok": False, "error": "Thiếu id"}), 400
+
+    acc = get_account_by_id(aid)
+    if not acc:
+        return jsonify({"ok": False, "error": "Không tìm thấy tài khoản"}), 404
+
+    account = account_json(acc)
+    assigned_key = account.get("assignedKey")
+    result = {
+        "ok": True,
+        "account": account,
+        "assignedKey": assigned_key,
+        "assignedExp": 0,
+        "maxDevices": account.get("maxDevices", 1)
+    }
+
+    if assigned_key:
+        key = get_key(assigned_key)
+        if key:
+            result["assignedExp"] = int(key.get("exp") or 0)
+            result["maxDevices"] = int(key.get("max_devices") or account.get("maxDevices") or 1)
+            result["key"] = assigned_key
+            result["keyInfo"] = key_json(key)
+
+    return jsonify(result)
+
+
 @app.post("/delete-account")
 def delete_account():
     d=request.get_json(silent=True) or {}; aid=str(d.get("accountId",""))
@@ -249,26 +281,61 @@ def delete_account():
 
 @app.post("/create-key")
 def create_key():
-    d=request.get_json(silent=True) or {}
-    k=str(d.get("key","")).strip(); user=str(d.get("user","") or "")
-    exp=int(d.get("exp") or 0); maxd=max(1,min(3,int(d.get("maxDevices") or 1)))
-    if not k or not exp: return jsonify({"ok":False,"error":"Thiếu key/exp"}),400
+    d = request.get_json(silent=True) or {}
+    k = str(d.get("key", "")).strip()
+    user = str(d.get("user", "") or "")
     try:
+        exp = int(d.get("exp") or 0)
+        maxd = max(1, min(3, int(d.get("maxDevices") or 1)))
+    except Exception:
+        return jsonify({"ok": False, "error": "exp/maxDevices không hợp lệ"}), 400
+
+    if not k or not exp:
+        return jsonify({"ok": False, "error": "Thiếu key/exp"}), 400
+
+    try:
+        created = now_ms()
         if DATABASE_URL:
-            con=pg(); c=con.cursor()
-            c.execute("""INSERT INTO keys(key,user_name,exp,max_devices,created_at)
-                         VALUES(%s,%s,%s,%s,%s)
-                         ON CONFLICT(key) DO UPDATE SET user_name=EXCLUDED.user_name,
-                         exp=EXCLUDED.exp,max_devices=EXCLUDED.max_devices,deleted=FALSE""",
-                      (k,user,exp,maxd,now_ms()))
-            con.commit(); c.close(); con.close()
+            con = pg()
+            try:
+                c = con.cursor()
+                c.execute("""INSERT INTO keys
+                    (key,user_name,exp,max_devices,devices,accounts,deleted,created_at)
+                    VALUES(%s,%s,%s,%s,'[]','[]',FALSE,%s)
+                    ON CONFLICT(key) DO UPDATE SET
+                      user_name=EXCLUDED.user_name,
+                      exp=EXCLUDED.exp,
+                      max_devices=EXCLUDED.max_devices,
+                      deleted=FALSE""",
+                    (k, user, exp, maxd, created))
+                c.execute("SELECT * FROM keys WHERE key=%s AND deleted=FALSE", (k,))
+                row = c.fetchone()
+                if not row:
+                    con.rollback()
+                    return jsonify({"ok": False, "error": "Ghi key thất bại"}), 500
+                con.commit()
+            finally:
+                c.close()
+                con.close()
         else:
-            con=sql_conn()
-            con.execute("""INSERT OR REPLACE INTO keys(key,user_name,exp,max_devices,devices,accounts,deleted,created_at)
-                           VALUES(?,?,?,?, '[]','[]',0,?)""",(k,user,exp,maxd,now_ms()))
-            con.commit(); con.close()
-        return jsonify({"ok":True,"key":k})
-    except Exception as e: return jsonify({"ok":False,"error":str(e)}),500
+            con = sql_conn()
+            try:
+                con.execute("""INSERT OR REPLACE INTO keys
+                    (key,user_name,exp,max_devices,devices,accounts,deleted,created_at)
+                    VALUES(?,?,?,?, '[]','[]',0,?)""",
+                    (k, user, exp, maxd, created))
+                con.commit()
+                row = con.execute(
+                    "SELECT * FROM keys WHERE key=? AND deleted=0", (k,)
+                ).fetchone()
+                if not row:
+                    return jsonify({"ok": False, "error": "Ghi key thất bại"}), 500
+            finally:
+                con.close()
+
+        return jsonify({"ok": True, "success": True, "key": k})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.get("/keys")
@@ -295,27 +362,128 @@ def delete_key():
 
 @app.post("/assign-key")
 def assign_key():
-    d=request.get_json(silent=True) or {}
-    aid=str(d.get("accountId","")); k=str(d.get("key","")); exp=int(d.get("exp") or 0)
-    maxd=max(1,min(3,int(d.get("maxDevices") or 1)))
-    acc=get_account_by_id(aid)
-    if not acc: return jsonify({"ok":False,"error":"Không tìm thấy tài khoản"}),404
-    if not k or not exp: return jsonify({"ok":False,"error":"Thiếu key/exp"}),400
-    # Create/replace key and attach it to account.
-    create_key_response = create_key()
-    if create_key_response[1] if isinstance(create_key_response, tuple) else False:
-        return create_key_response
-    if DATABASE_URL:
-        con=pg(); c=con.cursor()
-        c.execute("UPDATE accounts SET assigned_key=%s,max_devices=%s WHERE id=%s",(k,maxd,aid))
-        c.execute("UPDATE keys SET accounts='['||%s||']' WHERE key=%s",(json.dumps(aid),k))
-        con.commit(); c.close(); con.close()
-    else:
-        con=sql_conn()
-        con.execute("UPDATE accounts SET assigned_key=?,max_devices=? WHERE id=?",(k,maxd,aid))
-        con.execute("UPDATE keys SET accounts=?,max_devices=? WHERE key=?",(json.dumps([aid]),maxd,k))
-        con.commit(); con.close()
-    return jsonify({"ok":True,"key":k})
+    d = request.get_json(silent=True) or {}
+    aid = str(d.get("accountId", "")).strip()
+    k = str(d.get("key", "")).strip()
+
+    try:
+        exp = int(d.get("exp") or 0)
+        maxd = max(1, min(3, int(d.get("maxDevices") or 1)))
+    except Exception:
+        return jsonify({"ok": False, "error": "exp/maxDevices không hợp lệ"}), 400
+
+    if not aid or not k or not exp:
+        return jsonify({"ok": False, "error": "Thiếu accountId/key/exp"}), 400
+
+    try:
+        if DATABASE_URL:
+            con = pg()
+            try:
+                c = con.cursor()
+                c.execute(
+                    "SELECT * FROM accounts WHERE id=%s AND deleted=FALSE FOR UPDATE",
+                    (aid,)
+                )
+                row = c.fetchone()
+                if not row:
+                    con.rollback()
+                    return jsonify({"ok": False, "error": "Không tìm thấy tài khoản"}), 404
+
+                cols = [x[0] for x in c.description]
+                acc = dict(zip(cols, row))
+                now = now_ms()
+
+                c.execute("""INSERT INTO keys
+                    (key,user_name,exp,max_devices,devices,accounts,deleted,created_at)
+                    VALUES(%s,%s,%s,%s,'[]',%s,FALSE,%s)
+                    ON CONFLICT(key) DO UPDATE SET
+                      user_name=EXCLUDED.user_name,
+                      exp=EXCLUDED.exp,
+                      max_devices=EXCLUDED.max_devices,
+                      accounts=EXCLUDED.accounts,
+                      deleted=FALSE""",
+                    (k, acc["name"], exp, maxd, json.dumps([aid]), now))
+
+                c.execute(
+                    "UPDATE accounts SET assigned_key=%s,max_devices=%s WHERE id=%s",
+                    (k, maxd, aid)
+                )
+
+                # Verify inside the same transaction before commit.
+                c.execute(
+                    "SELECT assigned_key,max_devices FROM accounts WHERE id=%s",
+                    (aid,)
+                )
+                arow = c.fetchone()
+                c.execute(
+                    "SELECT key,exp,max_devices,accounts FROM keys WHERE key=%s AND deleted=FALSE",
+                    (k,)
+                )
+                krow = c.fetchone()
+
+                if not arow or arow[0] != k or not krow or krow[0] != k:
+                    con.rollback()
+                    return jsonify({"ok": False, "error": "Server xác minh sau khi ghi thất bại"}), 500
+
+                con.commit()
+            finally:
+                c.close()
+                con.close()
+        else:
+            con = sql_conn()
+            try:
+                row = con.execute(
+                    "SELECT * FROM accounts WHERE id=? AND deleted=0", (aid,)
+                ).fetchone()
+                if not row:
+                    return jsonify({"ok": False, "error": "Không tìm thấy tài khoản"}), 404
+
+                acc = dict(row)
+                now = now_ms()
+                con.execute("""INSERT OR REPLACE INTO keys
+                    (key,user_name,exp,max_devices,devices,accounts,deleted,created_at)
+                    VALUES(?,?,?,?, '[]',?,0,?)""",
+                    (k, acc["name"], exp, maxd, json.dumps([aid]), now))
+                con.execute(
+                    "UPDATE accounts SET assigned_key=?,max_devices=? WHERE id=?",
+                    (k, maxd, aid)
+                )
+
+                arow = con.execute(
+                    "SELECT assigned_key FROM accounts WHERE id=?", (aid,)
+                ).fetchone()
+                krow = con.execute(
+                    "SELECT key FROM keys WHERE key=? AND deleted=0", (k,)
+                ).fetchone()
+
+                if not arow or arow["assigned_key"] != k or not krow or krow["key"] != k:
+                    con.rollback()
+                    return jsonify({"ok": False, "error": "Server xác minh sau khi ghi thất bại"}), 500
+
+                con.commit()
+            finally:
+                con.close()
+
+        # Final read-back: this is what the frontend will consume.
+        check = get_account_by_id(aid)
+        if not check or check.get("assigned_key") != k:
+            return jsonify({"ok": False, "error": "Đã ghi nhưng đọc lại không thấy key"}), 500
+
+        key_row = get_key(k)
+        if not key_row:
+            return jsonify({"ok": False, "error": "Key không tồn tại sau khi cấp"}), 500
+
+        return jsonify({
+            "ok": True,
+            "success": True,
+            "key": k,
+            "accountId": aid,
+            "assignedKey": k,
+            "assignedExp": int(key_row["exp"]),
+            "maxDevices": int(key_row.get("max_devices") or maxd)
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.post("/verify-key")
@@ -385,7 +553,7 @@ def inbox():
 def api_info():
     return jsonify({"ok":True,"apiBase":PUBLIC_API_URL,"endpoints":[
         "/", "/health", "/register", "/login", "/accounts", "/delete-account",
-        "/create-key", "/keys", "/delete-key", "/assign-key", "/verify-key",
+        "/create-key", "/keys", "/delete-key", "/assign-key", "/my-account", "/verify-key",
         "/pricing", "/api/status", "/bank-config", "/inbox"
     ]})
 
