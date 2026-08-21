@@ -7,6 +7,7 @@ CORS(app)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 SQLITE_PATH = os.getenv("SQLITE_PATH", "/tmp/toolmowis.db")
+PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "https://taolavh09-1.onrender.com").rstrip("/")
 
 DEFAULT_PRICING = {
     "plans": {
@@ -148,7 +149,7 @@ def get_key(k):
 @app.get("/")
 def home():
     return jsonify({"ok": True, "service": "Toolmowis API", "status": "online",
-                    "database": "postgres" if DATABASE_URL else "sqlite"})
+                    "database": "postgres" if DATABASE_URL else "sqlite", "apiBase": PUBLIC_API_URL})
 
 
 @app.get("/health")
@@ -382,7 +383,7 @@ def inbox():
 
 @app.get("/api")
 def api_info():
-    return jsonify({"ok":True,"endpoints":[
+    return jsonify({"ok":True,"apiBase":PUBLIC_API_URL,"endpoints":[
         "/", "/health", "/register", "/login", "/accounts", "/delete-account",
         "/create-key", "/keys", "/delete-key", "/assign-key", "/verify-key",
         "/pricing", "/api/status", "/bank-config", "/inbox"
