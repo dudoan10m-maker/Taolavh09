@@ -1,6 +1,4 @@
-import os
-import json
-import sqlite3
+import os, json, time, secrets, sqlite3
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -10,12 +8,29 @@ CORS(app)
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 SQLITE_PATH = os.getenv("SQLITE_PATH", "/tmp/toolmowis.db")
 
+DEFAULT_PRICING = {
+    "plans": {
+        "1": {"base": 33000, "sale": 0, "saleExpiry": None},
+        "2": {"base": 41000, "sale": 0, "saleExpiry": None},
+        "3": {"base": 53000, "sale": 0, "saleExpiry": None},
+    },
+    "saleEnabled": False,
+}
+DEFAULT_STATUS = {"locked": False, "message": ""}
 
-def db_type():
-    return "postgres" if DATABASE_URL else "sqlite"
+
+def now_ms():
+    return int(time.time() * 1000)
 
 
-def sqlite_conn():
+def pg():
+    import psycopg2
+    con = psycopg2.connect(DATABASE_URL)
+    con.autocommit = False
+    return con
+
+
+def sql_conn():
     parent = os.path.dirname(SQLITE_PATH)
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -26,207 +41,360 @@ def sqlite_conn():
 
 def init_db():
     if DATABASE_URL:
-        import psycopg2
-        con = psycopg2.connect(DATABASE_URL)
+        con = pg()
         cur = con.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS accounts (
-                id TEXT PRIMARY KEY,
-                username TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL,
-                assigned_key TEXT,
-                max_devices INTEGER NOT NULL DEFAULT 1,
-                deleted BOOLEAN NOT NULL DEFAULT FALSE,
-                created_at BIGINT NOT NULL
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS keys (
-                key TEXT PRIMARY KEY,
-                max_devices INTEGER NOT NULL DEFAULT 1,
-                accounts TEXT NOT NULL DEFAULT '[]',
-                created_at BIGINT NOT NULL
-            )
-        """)
-        con.commit()
-        cur.close()
-        con.close()
+        cur.execute("""CREATE TABLE IF NOT EXISTS settings(
+            key TEXT PRIMARY KEY, value TEXT NOT NULL)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS accounts(
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL, assigned_key TEXT, max_devices INTEGER NOT NULL DEFAULT 1,
+            deleted BOOLEAN NOT NULL DEFAULT FALSE, created_at BIGINT NOT NULL)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS keys(
+            key TEXT PRIMARY KEY, user_name TEXT, exp BIGINT NOT NULL,
+            max_devices INTEGER NOT NULL DEFAULT 1, devices TEXT NOT NULL DEFAULT '[]',
+            accounts TEXT NOT NULL DEFAULT '[]', deleted BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at BIGINT NOT NULL)""")
+        con.commit(); cur.close(); con.close()
     else:
-        con = sqlite_conn()
-        cur = con.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS accounts (
-                id TEXT PRIMARY KEY,
-                username TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL,
-                assigned_key TEXT,
-                max_devices INTEGER NOT NULL DEFAULT 1,
-                deleted INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER NOT NULL
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS keys (
-                key TEXT PRIMARY KEY,
-                max_devices INTEGER NOT NULL DEFAULT 1,
-                accounts TEXT NOT NULL DEFAULT '[]',
-                created_at INTEGER NOT NULL
-            )
-        """)
-        con.commit()
-        con.close()
+        con = sql_conn(); c = con.cursor()
+        c.execute("""CREATE TABLE IF NOT EXISTS settings(
+            key TEXT PRIMARY KEY, value TEXT NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS accounts(
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL, assigned_key TEXT, max_devices INTEGER NOT NULL DEFAULT 1,
+            deleted INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS keys(
+            key TEXT PRIMARY KEY, user_name TEXT, exp INTEGER NOT NULL,
+            max_devices INTEGER NOT NULL DEFAULT 1, devices TEXT NOT NULL DEFAULT '[]',
+            accounts TEXT NOT NULL DEFAULT '[]', deleted INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL)""")
+        con.commit(); con.close()
 
 
-def now_ms():
-    import time
-    return int(time.time() * 1000)
-
-
-def get_setting(name, default):
+def setting_get(name, default):
     if DATABASE_URL:
-        import psycopg2
-        con = psycopg2.connect(DATABASE_URL)
-        cur = con.cursor()
-        cur.execute("SELECT value FROM settings WHERE key=%s", (name,))
-        row = cur.fetchone()
-        cur.close()
-        con.close()
+        con = pg(); c = con.cursor()
+        c.execute("SELECT value FROM settings WHERE key=%s", (name,))
+        row = c.fetchone(); c.close(); con.close()
+        raw = row[0] if row else None
     else:
-        con = sqlite_conn()
+        con = sql_conn()
         row = con.execute("SELECT value FROM settings WHERE key=?", (name,)).fetchone()
-        con.close()
-
-    if not row:
+        con.close(); raw = row["value"] if row else None
+    if raw is None:
         return default
-    try:
-        return json.loads(row[0] if not isinstance(row, sqlite3.Row) else row["value"])
-    except Exception:
-        return default
+    try: return json.loads(raw)
+    except Exception: return default
 
 
-def set_setting(name, value):
+def setting_set(name, value):
     raw = json.dumps(value, ensure_ascii=False)
     if DATABASE_URL:
-        import psycopg2
-        con = psycopg2.connect(DATABASE_URL)
-        cur = con.cursor()
-        cur.execute("""
-            INSERT INTO settings(key,value) VALUES(%s,%s)
-            ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value
-        """, (name, raw))
-        con.commit()
-        cur.close()
-        con.close()
+        con = pg(); c = con.cursor()
+        c.execute("""INSERT INTO settings(key,value) VALUES(%s,%s)
+                    ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value""", (name, raw))
+        con.commit(); c.close(); con.close()
     else:
-        con = sqlite_conn()
-        con.execute(
-            "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
-            (name, raw)
-        )
-        con.commit()
-        con.close()
+        con = sql_conn()
+        con.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (name, raw))
+        con.commit(); con.close()
 
 
-DEFAULT_PRICING = {
-    "plans": {
-        "1": {"base": 33000, "sale": 0, "saleExpiry": None},
-        "2": {"base": 41000, "sale": 0, "saleExpiry": None},
-        "3": {"base": 53000, "sale": 0, "saleExpiry": None}
-    },
-    "saleEnabled": False
-}
+def account_json(row):
+    if not row: return None
+    r = dict(row) if not isinstance(row, dict) else row
+    return {
+        "id": r["id"], "name": r["name"], "email": r["email"],
+        "password": r["password"], "assignedKey": r.get("assigned_key"),
+        "maxDevices": int(r.get("max_devices") or 1),
+        "createdAt": int(r["created_at"])
+    }
 
-DEFAULT_STATUS = {"locked": False, "message": ""}
+
+def key_json(row):
+    if not row: return None
+    r = dict(row) if not isinstance(row, dict) else row
+    devices = json.loads(r.get("devices") or "[]")
+    accounts = json.loads(r.get("accounts") or "[]")
+    return {
+        "key": r["key"], "user": r.get("user_name") or "",
+        "exp": int(r["exp"]), "maxDevices": int(r.get("max_devices") or 1),
+        "devicesUsed": len(devices), "devices": devices,
+        "accounts": accounts, "deleted": bool(r.get("deleted", False)),
+        "createdAt": int(r["created_at"])
+    }
+
+
+def get_account_by_id(aid):
+    if DATABASE_URL:
+        con=pg(); c=con.cursor(); c.execute("SELECT * FROM accounts WHERE id=%s AND deleted=FALSE",(aid,)); row=c.fetchone()
+        cols=[d[0] for d in c.description] if row else []
+        c.close(); con.close()
+        return dict(zip(cols,row)) if row else None
+    con=sql_conn(); row=con.execute("SELECT * FROM accounts WHERE id=? AND deleted=0",(aid,)).fetchone(); con.close()
+    return dict(row) if row else None
+
+
+def get_key(k):
+    if DATABASE_URL:
+        con=pg(); c=con.cursor(); c.execute("SELECT * FROM keys WHERE key=%s AND deleted=FALSE",(k,)); row=c.fetchone()
+        cols=[d[0] for d in c.description] if row else []
+        c.close(); con.close()
+        return dict(zip(cols,row)) if row else None
+    con=sql_conn(); row=con.execute("SELECT * FROM keys WHERE key=? AND deleted=0",(k,)).fetchone(); con.close()
+    return dict(row) if row else None
 
 
 @app.get("/")
 def home():
-    return jsonify({
-        "ok": True,
-        "service": "Toolmowis API",
-        "status": "online",
-        "database": db_type()
-    })
+    return jsonify({"ok": True, "service": "Toolmowis API", "status": "online",
+                    "database": "postgres" if DATABASE_URL else "sqlite"})
 
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "database": db_type()})
+    return jsonify({"ok": True, "database": "postgres" if DATABASE_URL else "sqlite"})
 
 
 @app.get("/api/status")
-def api_status():
-    return jsonify(get_setting("status", DEFAULT_STATUS))
+def get_status():
+    s = setting_get("status", DEFAULT_STATUS)
+    if DATABASE_URL:
+        try:
+            con=pg(); c=con.cursor(); c.execute("SELECT COUNT(*) FROM accounts WHERE deleted=FALSE")
+            n=c.fetchone()[0]; c.close(); con.close()
+            s = dict(s); s["storage"]="postgres"; s["accountCount"]=n
+        except Exception as e:
+            s=dict(s); s["storage"]="postgres-error"; s["dbError"]=str(e)
+    else:
+        s=dict(s); s["storage"]="sqlite"
+    return jsonify(s)
 
 
 @app.post("/api/status")
-def update_status():
-    data = request.get_json(silent=True) or {}
-    value = {
-        "locked": bool(data.get("locked", False)),
-        "message": str(data.get("message", "") or "")
-    }
-    set_setting("status", value)
-    return jsonify({"ok": True, "status": value})
+def set_status():
+    d=request.get_json(silent=True) or {}
+    s={"locked":bool(d.get("locked",False)), "message":str(d.get("message","") or "")}
+    setting_set("status",s); return jsonify(s)
+
+
+@app.post("/register")
+def register():
+    d=request.get_json(silent=True) or {}
+    email=str(d.get("email","")).strip()
+    password=str(d.get("password",""))
+    name=str(d.get("name") or d.get("username") or email.split("@")[0]).strip()
+    aid=str(d.get("id") or secrets.token_hex(12))
+    if not email or not password: return jsonify({"success":False,"error":"Thiếu email hoặc mật khẩu"}),400
+    try:
+        if DATABASE_URL:
+            con=pg(); c=con.cursor()
+            c.execute("SELECT id FROM accounts WHERE email=%s AND deleted=FALSE",(email,))
+            if c.fetchone(): c.close(); con.close(); return jsonify({"success":False,"error":"Tài khoản đã tồn tại"}),409
+            c.execute("""INSERT INTO accounts(id,name,email,password,created_at)
+                         VALUES(%s,%s,%s,%s,%s)""",(aid,name,email,password,now_ms()))
+            con.commit(); c.close(); con.close()
+        else:
+            con=sql_conn()
+            if con.execute("SELECT id FROM accounts WHERE email=? AND deleted=0",(email,)).fetchone():
+                con.close(); return jsonify({"success":False,"error":"Tài khoản đã tồn tại"}),409
+            con.execute("""INSERT INTO accounts(id,name,email,password,created_at)
+                           VALUES(?,?,?,?,?)""",(aid,name,email,password,now_ms()))
+            con.commit(); con.close()
+        acc={"id":aid,"name":name,"email":email,"password":password,
+             "assignedKey":None,"maxDevices":1,"createdAt":now_ms()}
+        return jsonify({"success":True,"account":acc})
+    except Exception as e:
+        return jsonify({"success":False,"error":str(e)}),500
+
+
+@app.post("/login")
+def login():
+    d=request.get_json(silent=True) or {}
+    email=str(d.get("email","")).strip(); password=str(d.get("password",""))
+    if DATABASE_URL:
+        con=pg(); c=con.cursor()
+        c.execute("SELECT * FROM accounts WHERE email=%s AND password=%s AND deleted=FALSE",(email,password))
+        row=c.fetchone(); cols=[x[0] for x in c.description] if row else []
+        c.close(); con.close(); row=dict(zip(cols,row)) if row else None
+    else:
+        con=sql_conn(); row=con.execute("SELECT * FROM accounts WHERE email=? AND password=? AND deleted=0",(email,password)).fetchone(); con.close()
+        row=dict(row) if row else None
+    if not row: return jsonify({"success":False,"error":"Sai email hoặc mật khẩu"}),401
+    return jsonify({"success":True,"account":account_json(row)})
+
+
+@app.get("/accounts")
+def accounts():
+    if DATABASE_URL:
+        con=pg(); c=con.cursor(); c.execute("SELECT * FROM accounts WHERE deleted=FALSE ORDER BY created_at DESC")
+        rows=c.fetchall(); cols=[x[0] for x in c.description]; c.close(); con.close()
+        arr=[account_json(dict(zip(cols,r))) for r in rows]
+    else:
+        con=sql_conn(); rows=con.execute("SELECT * FROM accounts WHERE deleted=0 ORDER BY created_at DESC").fetchall(); con.close()
+        arr=[account_json(dict(r)) for r in rows]
+    return jsonify({"accounts":arr})
+
+
+@app.post("/delete-account")
+def delete_account():
+    d=request.get_json(silent=True) or {}; aid=str(d.get("accountId",""))
+    if DATABASE_URL:
+        con=pg(); c=con.cursor(); c.execute("UPDATE accounts SET deleted=TRUE WHERE id=%s",(aid,)); con.commit(); c.close(); con.close()
+    else:
+        con=sql_conn(); con.execute("UPDATE accounts SET deleted=1 WHERE id=?",(aid,)); con.commit(); con.close()
+    return jsonify({"ok":True})
+
+
+@app.post("/create-key")
+def create_key():
+    d=request.get_json(silent=True) or {}
+    k=str(d.get("key","")).strip(); user=str(d.get("user","") or "")
+    exp=int(d.get("exp") or 0); maxd=max(1,min(3,int(d.get("maxDevices") or 1)))
+    if not k or not exp: return jsonify({"ok":False,"error":"Thiếu key/exp"}),400
+    try:
+        if DATABASE_URL:
+            con=pg(); c=con.cursor()
+            c.execute("""INSERT INTO keys(key,user_name,exp,max_devices,created_at)
+                         VALUES(%s,%s,%s,%s,%s)
+                         ON CONFLICT(key) DO UPDATE SET user_name=EXCLUDED.user_name,
+                         exp=EXCLUDED.exp,max_devices=EXCLUDED.max_devices,deleted=FALSE""",
+                      (k,user,exp,maxd,now_ms()))
+            con.commit(); c.close(); con.close()
+        else:
+            con=sql_conn()
+            con.execute("""INSERT OR REPLACE INTO keys(key,user_name,exp,max_devices,devices,accounts,deleted,created_at)
+                           VALUES(?,?,?,?, '[]','[]',0,?)""",(k,user,exp,maxd,now_ms()))
+            con.commit(); con.close()
+        return jsonify({"ok":True,"key":k})
+    except Exception as e: return jsonify({"ok":False,"error":str(e)}),500
+
+
+@app.get("/keys")
+def keys():
+    if DATABASE_URL:
+        con=pg(); c=con.cursor(); c.execute("SELECT * FROM keys WHERE deleted=FALSE ORDER BY created_at DESC")
+        rows=c.fetchall(); cols=[x[0] for x in c.description]; c.close(); con.close()
+        arr=[key_json(dict(zip(cols,r))) for r in rows]
+    else:
+        con=sql_conn(); rows=con.execute("SELECT * FROM keys WHERE deleted=0 ORDER BY created_at DESC").fetchall(); con.close()
+        arr=[key_json(dict(r)) for r in rows]
+    return jsonify({"keys":arr})
+
+
+@app.post("/delete-key")
+def delete_key():
+    d=request.get_json(silent=True) or {}; k=str(d.get("key",""))
+    if DATABASE_URL:
+        con=pg(); c=con.cursor(); c.execute("UPDATE keys SET deleted=TRUE WHERE key=%s",(k,)); con.commit(); c.close(); con.close()
+    else:
+        con=sql_conn(); con.execute("UPDATE keys SET deleted=1 WHERE key=?",(k,)); con.commit(); con.close()
+    return jsonify({"ok":True})
+
+
+@app.post("/assign-key")
+def assign_key():
+    d=request.get_json(silent=True) or {}
+    aid=str(d.get("accountId","")); k=str(d.get("key","")); exp=int(d.get("exp") or 0)
+    maxd=max(1,min(3,int(d.get("maxDevices") or 1)))
+    acc=get_account_by_id(aid)
+    if not acc: return jsonify({"ok":False,"error":"Không tìm thấy tài khoản"}),404
+    if not k or not exp: return jsonify({"ok":False,"error":"Thiếu key/exp"}),400
+    # Create/replace key and attach it to account.
+    create_key_response = create_key()
+    if create_key_response[1] if isinstance(create_key_response, tuple) else False:
+        return create_key_response
+    if DATABASE_URL:
+        con=pg(); c=con.cursor()
+        c.execute("UPDATE accounts SET assigned_key=%s,max_devices=%s WHERE id=%s",(k,maxd,aid))
+        c.execute("UPDATE keys SET accounts='['||%s||']' WHERE key=%s",(json.dumps(aid),k))
+        con.commit(); c.close(); con.close()
+    else:
+        con=sql_conn()
+        con.execute("UPDATE accounts SET assigned_key=?,max_devices=? WHERE id=?",(k,maxd,aid))
+        con.execute("UPDATE keys SET accounts=?,max_devices=? WHERE key=?",(json.dumps([aid]),maxd,k))
+        con.commit(); con.close()
+    return jsonify({"ok":True,"key":k})
+
+
+@app.post("/verify-key")
+def verify_key():
+    d=request.get_json(silent=True) or {}
+    k=str(d.get("key","")).strip(); device=str(d.get("device","")).strip()
+    row=get_key(k)
+    if not row: return jsonify({"valid":False,"error":"Key không tồn tại"}),404
+    exp=int(row["exp"]); maxd=int(row.get("max_devices") or 1)
+    if exp and now_ms()>exp: return jsonify({"valid":False,"error":"Key đã hết hạn"})
+    devices=json.loads(row.get("devices") or "[]")
+    accounts=json.loads(row.get("accounts") or "[]")
+    if device and device not in devices:
+        if len(devices)>=maxd:
+            return jsonify({"valid":False,"error":"Đã đủ số thiết bị","devicesUsed":len(devices),"maxDevices":maxd})
+        devices.append(device)
+    # Device count is global per key: different accounts using the same key
+    # consume the same shared device slots.
+    if DATABASE_URL:
+        con=pg(); c=con.cursor(); c.execute("UPDATE keys SET devices=%s WHERE key=%s",(json.dumps(devices),k))
+        con.commit(); c.close(); con.close()
+    else:
+        con=sql_conn(); con.execute("UPDATE keys SET devices=? WHERE key=?",(json.dumps(devices),k)); con.commit(); con.close()
+    return jsonify({"valid":True,"devicesUsed":len(devices),"maxDevices":maxd,
+                    "deviceCount":len(devices),"devices":devices,"key":k})
 
 
 @app.get("/pricing")
-def pricing():
-    return jsonify(get_setting("pricing", DEFAULT_PRICING))
+def get_pricing():
+    return jsonify(setting_get("pricing",DEFAULT_PRICING))
 
 
 @app.post("/pricing")
-def update_pricing():
-    data = request.get_json(silent=True) or {}
-    current = get_setting("pricing", DEFAULT_PRICING)
-    plans = current.get("plans", {})
-
-    incoming = data.get("plans", data)
-    for n in ("1", "2", "3"):
-        item = incoming.get(n, incoming.get(int(n), {})) if isinstance(incoming, dict) else {}
-        if item:
-            base = int(item.get("base", plans[n]["base"]))
-            sale = int(item.get("sale", plans[n]["sale"]))
-            if base < 0 or sale < 0 or (sale and sale >= base):
-                return jsonify({"ok": False, "error": f"Invalid pricing for plan {n}"}), 400
-            plans[n] = {
-                "base": base,
-                "sale": sale,
-                "saleExpiry": item.get("saleExpiry", plans[n].get("saleExpiry"))
+def set_pricing():
+    d=request.get_json(silent=True) or {}
+    cur=setting_get("pricing",DEFAULT_PRICING)
+    plans=d.get("plans") or d.get("pricingByDevices") or {}
+    for n in ("1","2","3"):
+        x=plans.get(n) or plans.get(int(n)) or {}
+        if x:
+            cur["plans"][n]={
+                "base":int(x.get("base",cur["plans"][n]["base"])),
+                "sale":int(x.get("sale",cur["plans"][n].get("sale",0))),
+                "saleExpiry":x.get("saleExpiry",cur["plans"][n].get("saleExpiry"))
             }
+    cur["saleEnabled"]=bool(d.get("saleEnabled",cur.get("saleEnabled",False)))
+    setting_set("pricing",cur); return jsonify(cur)
 
-    current["plans"] = plans
-    current["saleEnabled"] = bool(data.get("saleEnabled", current.get("saleEnabled", False)))
-    set_setting("pricing", current)
-    return jsonify({"ok": True, "pricing": current})
+
+@app.get("/bank-config")
+def bank_config():
+    return jsonify(setting_get("bankConfig",{}))
+
+
+@app.post("/bank-config")
+def set_bank_config():
+    d=request.get_json(silent=True) or {}
+    setting_set("bankConfig",d); return jsonify({"ok":True,"config":d})
+
+
+@app.get("/inbox")
+def inbox():
+    return jsonify({"ok":True,"items":[]})
 
 
 @app.get("/api")
-def api_root():
-    return jsonify({
-        "ok": True,
-        "endpoints": ["/", "/health", "/api/status", "/pricing"]
-    })
+def api_info():
+    return jsonify({"ok":True,"endpoints":[
+        "/", "/health", "/register", "/login", "/accounts", "/delete-account",
+        "/create-key", "/keys", "/delete-key", "/assign-key", "/verify-key",
+        "/pricing", "/api/status", "/bank-config", "/inbox"
+    ]})
 
 
 @app.errorhandler(404)
 def not_found(_):
-    return jsonify({"ok": False, "error": "Not Found"}), 404
+    return jsonify({"ok":False,"error":"Not Found"}),404
 
 
 init_db()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+    app.run(host="0.0.0.0",port=int(os.getenv("PORT","10000")))
