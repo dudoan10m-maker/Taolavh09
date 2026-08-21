@@ -552,6 +552,74 @@ def set_bank_config():
     setting_set("bankConfig",d); return jsonify({"ok":True,"config":d})
 
 
+DEFAULT_GAME_CONFIG = {
+    "games": {
+        "sunwin": True, "68game": True, "lc79": True, "ta28": True, "hitclub": True
+    },
+    "features": {"analysis": True, "gamelinks": True},
+    "maintMsgs": {},
+    "links": {
+        "sunwin": "https://web.sunwin.pizza/?affId=Sunwin",
+        "68game": "https://68gbcskh2.cfd/?code=25546789",
+        "lc79": "https://lc79b.bet/",
+        "ta28": "http://TA28.WORK",
+        "hitclub": "https://hitclub.app/"
+    }
+}
+
+
+def _merge_game_config(current, payload):
+    cfg = dict(current or {})
+    for section in ("games", "features", "maintMsgs", "links"):
+        if section not in cfg or not isinstance(cfg.get(section), dict):
+            cfg[section] = {}
+    if isinstance(payload.get("links"), dict):
+        for k, v in payload["links"].items():
+            if isinstance(k, str) and isinstance(v, str) and v.strip():
+                cfg["links"][k] = v.strip()
+    if isinstance(payload.get("games"), dict):
+        cfg["games"].update(payload["games"])
+    if isinstance(payload.get("features"), dict):
+        cfg["features"].update(payload["features"])
+    if isinstance(payload.get("maintMsgs"), dict):
+        cfg["maintMsgs"].update(payload["maintMsgs"])
+    # Support the existing admin toggle format: {game, enabled, maintMsg}
+    if payload.get("game") is not None:
+        game = str(payload.get("game")).strip()
+        if game:
+            cfg["games"][game] = bool(payload.get("enabled", True))
+            if "maintMsg" in payload:
+                cfg["maintMsgs"][game] = str(payload.get("maintMsg") or "")
+    # Support the existing feature toggle format: {feature, enabled}
+    if payload.get("feature") is not None:
+        feat = str(payload.get("feature")).strip()
+        if feat:
+            cfg["features"][feat] = bool(payload.get("enabled", True))
+    return cfg
+
+
+@app.get("/api/game-config")
+def get_game_config():
+    cfg = setting_get("gameConfig", DEFAULT_GAME_CONFIG)
+    cfg = _merge_game_config(DEFAULT_GAME_CONFIG, cfg)
+    return jsonify(cfg)
+
+
+@app.post("/api/game-config")
+def set_game_config():
+    payload = request.get_json(silent=True) or {}
+    current = setting_get("gameConfig", DEFAULT_GAME_CONFIG)
+    cfg = _merge_game_config(current, payload)
+    try:
+        setting_set("gameConfig", cfg)
+        saved = setting_get("gameConfig", None)
+        if not saved or saved.get("links") != cfg.get("links"):
+            return jsonify({"ok": False, "error": "Không xác minh được cấu hình link sau khi lưu"}), 500
+        return jsonify({"ok": True, **saved})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.get("/inbox")
 def inbox():
     return jsonify({"ok":True,"items":[]})
@@ -562,7 +630,7 @@ def api_info():
     return jsonify({"ok":True,"apiBase":PUBLIC_API_URL,"endpoints":[
         "/", "/health", "/register", "/login", "/accounts", "/delete-account",
         "/create-key", "/keys", "/delete-key", "/assign-key", "/my-account", "/verify-key",
-        "/pricing", "/api/status", "/bank-config", "/inbox"
+        "/pricing", "/api/status", "/bank-config", "/api/game-config", "/inbox"
     ]})
 
 
