@@ -7,7 +7,7 @@ CORS(app)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 SQLITE_PATH = os.getenv("SQLITE_PATH", "/tmp/toolmowis.db")
-PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "https://taolavh09-2.onrender.com").rstrip("/")
+PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "https://taolavh09-3.onrender.com").rstrip("/")
 
 DEFAULT_PRICING = {
     "plans": {
@@ -176,7 +176,11 @@ def get_status():
 def set_status():
     d=request.get_json(silent=True) or {}
     s={"locked":bool(d.get("locked",False)), "message":str(d.get("message","") or "")}
-    setting_set("status",s); return jsonify(s)
+    setting_set("status",s)
+    saved = setting_get("status", None)
+    if saved != s:
+        return jsonify({"ok":False,"error":"Bảo trì chưa được lưu/xác minh trên server"}),500
+    return jsonify({"ok":True, **saved})
 
 
 @app.post("/register")
@@ -530,7 +534,11 @@ def set_pricing():
                 "saleExpiry":x.get("saleExpiry",cur["plans"][n].get("saleExpiry"))
             }
     cur["saleEnabled"]=bool(d.get("saleEnabled",cur.get("saleEnabled",False)))
-    setting_set("pricing",cur); return jsonify(cur)
+    setting_set("pricing",cur)
+    saved = setting_get("pricing", None)
+    if saved != cur:
+        return jsonify({"ok":False,"error":"SALE chưa được lưu/xác minh trên server"}),500
+    return jsonify({"ok":True, **saved})
 
 
 @app.get("/bank-config")
