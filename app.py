@@ -6,10 +6,7 @@ app = Flask(__name__)
 CORS(app)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-# Render's normal filesystem is ephemeral. If PostgreSQL is not configured,
-# prefer a mounted persistent disk at /data; SQLITE_PATH can override it.
-_DEFAULT_SQLITE = "/data/toolmowis.db" if os.getenv("RENDER") else "/tmp/toolmowis.db"
-SQLITE_PATH = os.getenv("SQLITE_PATH", _DEFAULT_SQLITE)
+SQLITE_PATH = os.getenv("SQLITE_PATH", "/tmp/toolmowis.db")
 PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "https://taolavh09-3.onrender.com").rstrip("/")
 
 DEFAULT_PRICING = {
@@ -29,19 +26,29 @@ def now_ms():
 
 def pg():
     import psycopg2
-    connect_kwargs = {}
-    if "sslmode=" not in DATABASE_URL.lower():
-        connect_kwargs["sslmode"] = "require"
-    con = psycopg2.connect(DATABASE_URL, **connect_kwargs)
+    con = psycopg2.connect(DATABASE_URL)
     con.autocommit = False
     return con
 
 
 def sql_conn():
-    parent = os.path.dirname(SQLITE_PATH)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    con = sqlite3.connect(SQLITE_PATH)
+    """Mở SQLite; nếu đường dẫn cấu hình không ghi được thì tự fallback /tmp."""
+    global SQLITE_PATH
+    path = SQLITE_PATH
+    parent = os.path.dirname(path)
+
+    try:
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        con = sqlite3.connect(path)
+    except (PermissionError, OSError):
+        fallback = "/tmp/toolmowis.db"
+        if path != fallback:
+            SQLITE_PATH = fallback
+            con = sqlite3.connect(fallback)
+        else:
+            raise
+
     con.row_factory = sqlite3.Row
     return con
 
@@ -631,32 +638,12 @@ def inbox():
     return jsonify({"ok":True,"items":[]})
 
 
-@app.get("/api/storage")
-def storage_info():
-    """Show the authoritative storage backend for persistent settings."""
-    if DATABASE_URL:
-        try:
-            con = pg()
-            c = con.cursor()
-            c.execute("SELECT COUNT(*) FROM settings")
-            n = c.fetchone()[0]
-            c.close(); con.close()
-            return jsonify({"ok": True, "storage": "postgres", "settingsCount": n})
-        except Exception as e:
-            return jsonify({"ok": False, "storage": "postgres-error", "error": str(e)}), 500
-    return jsonify({
-        "ok": True,
-        "storage": "sqlite",
-        "sqlitePath": SQLITE_PATH,
-        "persistentDiskRequired": bool(os.getenv("RENDER"))
-    })
-
 @app.get("/api")
 def api_info():
     return jsonify({"ok":True,"apiBase":PUBLIC_API_URL,"endpoints":[
         "/", "/health", "/register", "/login", "/accounts", "/delete-account",
         "/create-key", "/keys", "/delete-key", "/assign-key", "/my-account", "/verify-key",
-        "/pricing", "/api/status", "/bank-config", "/api/game-config", "/api/storage", "/inbox"
+        "/pricing", "/api/status", "/bank-config", "/api/game-config", "/inbox"
     ]})
 
 
