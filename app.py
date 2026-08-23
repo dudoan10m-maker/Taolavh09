@@ -9,7 +9,7 @@ CORS(app)
 # Fallback is included so the service can connect immediately after deployment.
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://taolavh09_db_user:clhlySNpQIPgNhKwn6P3sKT5q3ulyNIS@dpg-da4q5u3bc2fs73c042ug-a/taolavh09_db").strip()
 SQLITE_PATH = os.getenv("SQLITE_PATH", "/tmp/toolmowis.db")
-PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "https://taolavh09-3.onrender.com").rstrip("/")
+PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "https://taolavh09-9.onrender.com").rstrip("/")
 
 DEFAULT_PRICING = {
     "plans": {
@@ -20,6 +20,15 @@ DEFAULT_PRICING = {
     "saleEnabled": False,
 }
 DEFAULT_STATUS = {"locked": False, "message": ""}
+
+# Payment/order backend remains separate from the main API.
+# The frontend MUST keep SERVER_URL = https://taolavh09-9.onrender.com.
+# This backend is only used internally by /create-order so the payment verifier
+# can see the exact same orderId/price/content when /payment-proof is called.
+PAYMENT_BACKEND_URL = os.getenv(
+    "PAYMENT_BACKEND_URL",
+    "https://keytudong-1.onrender.com"
+).rstrip("/")
 
 
 def now_ms():
@@ -157,6 +166,108 @@ def home():
 @app.get("/health")
 def health():
     return jsonify({"ok": True, "database": "postgres" if DATABASE_URL else "sqlite"})
+
+
+def _forward_json_post(url, payload, timeout=20):
+    """POST JSON without adding a third-party HTTP dependency."""
+    from urllib.request import Request, urlopen
+    from urllib.error import HTTPError, URLError
+
+    raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = Request(
+        url,
+        data=raw,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "Toolmowis-Main-API/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            status = int(getattr(resp, "status", 200))
+            try:
+                data = json.loads(body) if body else {}
+            except Exception:
+                data = {"raw": body}
+            return status, data
+    except HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        try:
+            data = json.loads(body) if body else {}
+        except Exception:
+            data = {"error": body or str(e)}
+        return int(e.code), data
+    except URLError as e:
+        raise RuntimeError(f"Không kết nối được payment backend: {e.reason}") from e
+
+
+@app.post("/create-order")
+def create_order():
+    """
+    Browser-facing order endpoint on the MAIN server.
+
+    The browser calls:
+        https://taolavh09-9.onrender.com/create-order
+
+    The order itself is created by the separate payment backend so that
+    /payment-proof on keytudong-1 can validate the exact same orderId,
+    amount and transfer content. This avoids creating two unrelated orders.
+    """
+    d = request.get_json(silent=True) or {}
+
+    plan_key = str(d.get("planKey", "")).strip()
+    device = str(d.get("device", "")).strip()
+    account_id = str(d.get("accountId", "")).strip()
+
+    if plan_key not in {"1", "2", "3"}:
+        return jsonify({"ok": False, "error": "Gói key không hợp lệ."}), 400
+
+    if not device:
+        return jsonify({"ok": False, "error": "Thiếu device."}), 400
+
+    payload = {
+        "planKey": plan_key,
+        "device": device,
+        "accountId": account_id,
+    }
+
+    try:
+        status, data = _forward_json_post(
+            PAYMENT_BACKEND_URL + "/create-order",
+            payload,
+            timeout=20,
+        )
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": str(e),
+            "paymentBackend": PAYMENT_BACKEND_URL,
+        }), 502
+
+    if status < 200 or status >= 300:
+        return jsonify({
+            "ok": False,
+            "error": data.get("error") or data.get("message") or f"Payment backend HTTP {status}",
+            "paymentBackendStatus": status,
+        }), 502
+
+    # The frontend requires {order: ...}. Keep the backend response intact
+    # while normalizing a few common response shapes.
+    order = data.get("order")
+    if not order and isinstance(data.get("data"), dict):
+        order = data["data"].get("order")
+
+    if not order:
+        return jsonify({
+            "ok": False,
+            "error": "Payment backend không trả về order.",
+            "paymentBackendStatus": status,
+        }), 502
+
+    return jsonify({"ok": True, "order": order})
 
 
 @app.get("/api/status")
@@ -632,7 +743,7 @@ def api_info():
     return jsonify({"ok":True,"apiBase":PUBLIC_API_URL,"endpoints":[
         "/", "/health", "/register", "/login", "/accounts", "/delete-account",
         "/create-key", "/keys", "/delete-key", "/assign-key", "/my-account", "/verify-key",
-        "/pricing", "/api/status", "/bank-config", "/api/game-config", "/inbox"
+        "/pricing", "/api/status", "/bank-config", "/api/game-config", "/inbox", "/create-order"
     ]})
 
 
