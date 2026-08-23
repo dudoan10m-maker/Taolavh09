@@ -5,7 +5,9 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+# PostgreSQL connection: Render Environment Variable takes priority.
+# Fallback is included so the service can connect immediately after deployment.
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://taolavh09_db_user:clhlySNpQIPgNhKwn6P3sKT5q3ulyNIS@dpg-da4q5u3bc2fs73c042ug-a/taolavh09_db").strip()
 SQLITE_PATH = os.getenv("SQLITE_PATH", "/tmp/toolmowis.db")
 PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "https://taolavh09-3.onrender.com").rstrip("/")
 
@@ -32,23 +34,10 @@ def pg():
 
 
 def sql_conn():
-    """Mở SQLite; nếu đường dẫn cấu hình không ghi được thì tự fallback /tmp."""
-    global SQLITE_PATH
-    path = SQLITE_PATH
-    parent = os.path.dirname(path)
-
-    try:
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        con = sqlite3.connect(path)
-    except (PermissionError, OSError):
-        fallback = "/tmp/toolmowis.db"
-        if path != fallback:
-            SQLITE_PATH = fallback
-            con = sqlite3.connect(fallback)
-        else:
-            raise
-
+    parent = os.path.dirname(SQLITE_PATH)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    con = sqlite3.connect(SQLITE_PATH)
     con.row_factory = sqlite3.Row
     return con
 
