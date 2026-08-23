@@ -7,7 +7,7 @@ CORS(app)
 
 # PostgreSQL connection: Render Environment Variable takes priority.
 # Fallback is included so the service can connect immediately after deployment.
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://taolavh09_db_user:clhlySNpQIPgNhKwn6P3sKT5q3ulyNIS@dpg-da4q5u3bc2fs73c042ug-a/taolavh09_db").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 SQLITE_PATH = os.getenv("SQLITE_PATH", "/tmp/toolmowis.db")
 PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "https://taolavh09-9.onrender.com").rstrip("/")
 
