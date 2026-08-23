@@ -1,13 +1,13 @@
-TOOLMOWIS BACKEND
+TOOLMOWIS BACKEND - FIXED
 
-API URL mới:
-os.getenv("PUBLIC_API_URL", "https://taolavh09-1.onrender.com").rstrip("/")
+Production API:
+https://taolavh10.onrender.com
 
-Render Start Command:
+Persistence:
+- Render PostgreSQL is required.
+- DATABASE_URL is injected from the Render PostgreSQL database.
+- No database password is hard-coded in app.py.
+- REQUIRE_POSTGRES=true prevents silent fallback to /tmp SQLite.
+
+Start:
 gunicorn app:app
-
-Biến môi trường bắt buộc để lưu vĩnh viễn:
-DATABASE_URL=<PostgreSQL Internal Database URL>
-
-Nếu admin/frontend có biến API_BASE thì đặt:
-https://taolavh09-1.onrender.com

@@ -8,8 +8,10 @@ CORS(app)
 # PostgreSQL connection: Render Environment Variable takes priority.
 # Fallback is included so the service can connect immediately after deployment.
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+# Production must use Render PostgreSQL. Never hard-code database credentials in source.
+REQUIRE_POSTGRES = os.getenv("REQUIRE_POSTGRES", "true").strip().lower() == "true"
 SQLITE_PATH = os.getenv("SQLITE_PATH", "/tmp/toolmowis.db")
-PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "https://taolavh09-9.onrender.com").rstrip("/")
+PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "https://taolavh10.onrender.com").rstrip("/")
 
 DEFAULT_PRICING = {
     "plans": {
@@ -20,15 +22,6 @@ DEFAULT_PRICING = {
     "saleEnabled": False,
 }
 DEFAULT_STATUS = {"locked": False, "message": ""}
-
-# Payment/order backend remains separate from the main API.
-# The frontend MUST keep SERVER_URL = https://taolavh09-9.onrender.com.
-# This backend is only used internally by /create-order so the payment verifier
-# can see the exact same orderId/price/content when /payment-proof is called.
-PAYMENT_BACKEND_URL = os.getenv(
-    "PAYMENT_BACKEND_URL",
-    "https://keytudong-1.onrender.com"
-).rstrip("/")
 
 
 def now_ms():
@@ -52,6 +45,8 @@ def sql_conn():
 
 
 def init_db():
+    if REQUIRE_POSTGRES and not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL chưa được cấu hình. Hãy gắn Render PostgreSQL Internal Database URL vào Environment.")
     if DATABASE_URL:
         con = pg()
         cur = con.cursor()
@@ -66,6 +61,9 @@ def init_db():
             max_devices INTEGER NOT NULL DEFAULT 1, devices TEXT NOT NULL DEFAULT '[]',
             accounts TEXT NOT NULL DEFAULT '[]', deleted BOOLEAN NOT NULL DEFAULT FALSE,
             created_at BIGINT NOT NULL)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS sessions(
+            account_id TEXT PRIMARY KEY, device TEXT, last_seen BIGINT NOT NULL,
+            online BOOLEAN NOT NULL DEFAULT TRUE)""")
         con.commit(); cur.close(); con.close()
     else:
         con = sql_conn(); c = con.cursor()
@@ -80,6 +78,9 @@ def init_db():
             max_devices INTEGER NOT NULL DEFAULT 1, devices TEXT NOT NULL DEFAULT '[]',
             accounts TEXT NOT NULL DEFAULT '[]', deleted INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS sessions(
+            account_id TEXT PRIMARY KEY, device TEXT, last_seen INTEGER NOT NULL,
+            online INTEGER NOT NULL DEFAULT 1)""")
         con.commit(); con.close()
 
 
@@ -157,6 +158,59 @@ def get_key(k):
     return dict(row) if row else None
 
 
+def session_touch(account_id, device=""):
+    account_id = str(account_id or "").strip()
+    if not account_id:
+        return False
+    ts = now_ms()
+    if DATABASE_URL:
+        con=pg(); c=con.cursor()
+        c.execute("""INSERT INTO sessions(account_id,device,last_seen,online) VALUES(%s,%s,%s,TRUE)
+                     ON CONFLICT(account_id) DO UPDATE SET device=EXCLUDED.device,last_seen=EXCLUDED.last_seen,online=TRUE""",
+                  (account_id,str(device or ""),ts))
+        con.commit(); c.close(); con.close()
+    else:
+        con=sql_conn(); con.execute("INSERT OR REPLACE INTO sessions(account_id,device,last_seen,online) VALUES(?,?,?,1)",(account_id,str(device or ""),ts)); con.commit(); con.close()
+    return True
+
+def session_offline(account_id):
+    account_id=str(account_id or "").strip()
+    if not account_id: return False
+    if DATABASE_URL:
+        con=pg(); c=con.cursor(); c.execute("UPDATE sessions SET online=FALSE,last_seen=%s WHERE account_id=%s",(now_ms(),account_id)); con.commit(); c.close(); con.close()
+    else:
+        con=sql_conn(); con.execute("UPDATE sessions SET online=0,last_seen=? WHERE account_id=?",(now_ms(),account_id)); con.commit(); con.close()
+    return True
+
+@app.get("/api/sessions")
+def get_sessions():
+    cutoff=now_ms()-120000
+    if DATABASE_URL:
+        con=pg(); c=con.cursor(); c.execute("UPDATE sessions SET online=FALSE WHERE last_seen < %s",(cutoff,)); con.commit()
+        c.execute("""SELECT account_id,device,last_seen,online FROM sessions WHERE online=TRUE ORDER BY last_seen DESC""")
+        rows=c.fetchall(); c.close(); con.close()
+    else:
+        con=sql_conn(); con.execute("UPDATE sessions SET online=0 WHERE last_seen < ?",(cutoff,)); con.commit()
+        rows=con.execute("SELECT account_id,device,last_seen,online FROM sessions WHERE online=1 ORDER BY last_seen DESC").fetchall(); con.close()
+    return jsonify({"ok":True,"sessions":[{"accountId":r[0],"device":r[1] or "","lastSeen":int(r[2]),"online":bool(r[3])} for r in rows]})
+
+@app.post("/api/sessions/heartbeat")
+def heartbeat():
+    d=request.get_json(silent=True) or {}
+    aid=str(d.get("accountId") or d.get("userId") or "").strip()
+    if not aid: return jsonify({"ok":False,"error":"Thiếu accountId"}),400
+    if not get_account_by_id(aid): return jsonify({"ok":False,"error":"Tài khoản không tồn tại"}),404
+    session_touch(aid,d.get("device",""))
+    return jsonify({"ok":True,"accountId":aid,"online":True,"lastSeen":now_ms()})
+
+@app.post("/api/sessions/offline")
+def offline():
+    d=request.get_json(silent=True) or {}
+    aid=str(d.get("accountId") or d.get("userId") or "").strip()
+    if not aid: return jsonify({"ok":False,"error":"Thiếu accountId"}),400
+    session_offline(aid)
+    return jsonify({"ok":True,"accountId":aid,"online":False})
+
 @app.get("/")
 def home():
     return jsonify({"ok": True, "service": "Toolmowis API", "status": "online",
@@ -166,108 +220,6 @@ def home():
 @app.get("/health")
 def health():
     return jsonify({"ok": True, "database": "postgres" if DATABASE_URL else "sqlite"})
-
-
-def _forward_json_post(url, payload, timeout=20):
-    """POST JSON without adding a third-party HTTP dependency."""
-    from urllib.request import Request, urlopen
-    from urllib.error import HTTPError, URLError
-
-    raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = Request(
-        url,
-        data=raw,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "Toolmowis-Main-API/1.0",
-        },
-        method="POST",
-    )
-    try:
-        with urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-            status = int(getattr(resp, "status", 200))
-            try:
-                data = json.loads(body) if body else {}
-            except Exception:
-                data = {"raw": body}
-            return status, data
-    except HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        try:
-            data = json.loads(body) if body else {}
-        except Exception:
-            data = {"error": body or str(e)}
-        return int(e.code), data
-    except URLError as e:
-        raise RuntimeError(f"Không kết nối được payment backend: {e.reason}") from e
-
-
-@app.post("/create-order")
-def create_order():
-    """
-    Browser-facing order endpoint on the MAIN server.
-
-    The browser calls:
-        https://taolavh09-9.onrender.com/create-order
-
-    The order itself is created by the separate payment backend so that
-    /payment-proof on keytudong-1 can validate the exact same orderId,
-    amount and transfer content. This avoids creating two unrelated orders.
-    """
-    d = request.get_json(silent=True) or {}
-
-    plan_key = str(d.get("planKey", "")).strip()
-    device = str(d.get("device", "")).strip()
-    account_id = str(d.get("accountId", "")).strip()
-
-    if plan_key not in {"1", "2", "3"}:
-        return jsonify({"ok": False, "error": "Gói key không hợp lệ."}), 400
-
-    if not device:
-        return jsonify({"ok": False, "error": "Thiếu device."}), 400
-
-    payload = {
-        "planKey": plan_key,
-        "device": device,
-        "accountId": account_id,
-    }
-
-    try:
-        status, data = _forward_json_post(
-            PAYMENT_BACKEND_URL + "/create-order",
-            payload,
-            timeout=20,
-        )
-    except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": str(e),
-            "paymentBackend": PAYMENT_BACKEND_URL,
-        }), 502
-
-    if status < 200 or status >= 300:
-        return jsonify({
-            "ok": False,
-            "error": data.get("error") or data.get("message") or f"Payment backend HTTP {status}",
-            "paymentBackendStatus": status,
-        }), 502
-
-    # The frontend requires {order: ...}. Keep the backend response intact
-    # while normalizing a few common response shapes.
-    order = data.get("order")
-    if not order and isinstance(data.get("data"), dict):
-        order = data["data"].get("order")
-
-    if not order:
-        return jsonify({
-            "ok": False,
-            "error": "Payment backend không trả về order.",
-            "paymentBackendStatus": status,
-        }), 502
-
-    return jsonify({"ok": True, "order": order})
 
 
 @app.get("/api/status")
@@ -743,7 +695,7 @@ def api_info():
     return jsonify({"ok":True,"apiBase":PUBLIC_API_URL,"endpoints":[
         "/", "/health", "/register", "/login", "/accounts", "/delete-account",
         "/create-key", "/keys", "/delete-key", "/assign-key", "/my-account", "/verify-key",
-        "/pricing", "/api/status", "/bank-config", "/api/game-config", "/inbox", "/create-order"
+        "/pricing", "/api/status", "/bank-config", "/api/game-config", "/inbox"
     ]})
 
 

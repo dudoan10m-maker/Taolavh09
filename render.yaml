@@ -6,4 +6,15 @@ services:
     startCommand: gunicorn app:app
     envVars:
       - key: DATABASE_URL
-        sync: false
+        fromDatabase:
+          name: toolmowis-db
+          property: connectionString
+      - key: PUBLIC_API_URL
+        value: https://taolavh10.onrender.com
+      - key: REQUIRE_POSTGRES
+        value: "true"
+
+databases:
+  - name: toolmowis-db
+    databaseName: toolmowis
+    user: toolmowis
