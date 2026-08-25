@@ -9,7 +9,7 @@ CORS(app)
 # Fallback is included so the service can connect immediately after deployment.
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://taolavh09_db_user:clhlySNpQIPgNhKwn6P3sKT5q3ulyNIS@dpg-da4q5u3bc2fs73c042ug-a/taolavh09_db").strip()
 SQLITE_PATH = os.getenv("SQLITE_PATH", "/tmp/toolmowis.db")
-PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "https://taolavh09-3.onrender.com").rstrip("/")
+PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "https://taolavh09-9.onrender.com").rstrip("/")
 
 DEFAULT_PRICING = {
     "plans": {
@@ -24,6 +24,22 @@ DEFAULT_STATUS = {"locked": False, "message": ""}
 
 def now_ms():
     return int(time.time() * 1000)
+
+
+def normalize_exp_ms(value):
+    """Chuẩn hoá thời gian hết hạn về milliseconds.
+    Admin có thể gửi Unix seconds (10 chữ số) hoặc milliseconds (13 chữ số).
+    """
+    try:
+        n = int(float(value or 0))
+    except (TypeError, ValueError):
+        return 0
+    if n <= 0:
+        return 0
+    # Unix timestamp tính bằng giây hiện tại chỉ khoảng 10 chữ số.
+    if n < 100_000_000_000:
+        n *= 1000
+    return n
 
 
 def pg():
@@ -291,7 +307,7 @@ def create_key():
     k = str(d.get("key", "")).strip()
     user = str(d.get("user", "") or "")
     try:
-        exp = int(d.get("exp") or 0)
+        exp = normalize_exp_ms(d.get("exp"))
         maxd = max(1, min(3, int(d.get("maxDevices") or 1)))
     except Exception:
         return jsonify({"ok": False, "error": "exp/maxDevices không hợp lệ"}), 400
@@ -373,7 +389,7 @@ def assign_key():
     k = str(d.get("key", "")).strip()
 
     try:
-        exp = int(d.get("exp") or 0)
+        exp = normalize_exp_ms(d.get("exp"))
         maxd = max(1, min(3, int(d.get("maxDevices") or 1)))
     except Exception:
         return jsonify({"ok": False, "error": "exp/maxDevices không hợp lệ"}), 400
@@ -498,8 +514,9 @@ def verify_key():
     k=str(d.get("key","")).strip(); device=str(d.get("device","")).strip()
     row=get_key(k)
     if not row: return jsonify({"valid":False,"error":"Key không tồn tại"}),404
-    exp=int(row["exp"]); maxd=int(row.get("max_devices") or 1)
-    if exp and now_ms()>exp: return jsonify({"valid":False,"error":"Key đã hết hạn"})
+    exp=normalize_exp_ms(row["exp"]); maxd=int(row.get("max_devices") or 1)
+    if exp and now_ms()>exp:
+        return jsonify({"valid":False,"error":"Key đã hết hạn","expiry":exp})
     devices=json.loads(row.get("devices") or "[]")
     accounts=json.loads(row.get("accounts") or "[]")
     if device and device not in devices:
@@ -514,7 +531,8 @@ def verify_key():
     else:
         con=sql_conn(); con.execute("UPDATE keys SET devices=? WHERE key=?",(json.dumps(devices),k)); con.commit(); con.close()
     return jsonify({"valid":True,"devicesUsed":len(devices),"maxDevices":maxd,
-                    "deviceCount":len(devices),"devices":devices,"key":k})
+                    "deviceCount":len(devices),"devices":devices,"key":k,
+                    "expiry":exp,"exp":exp,"expiresAt":exp})
 
 
 @app.get("/pricing")
