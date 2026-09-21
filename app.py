@@ -5,11 +5,15 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-# PostgreSQL connection: Render Environment Variable takes priority.
-# Fallback is included so the service can connect immediately after deployment.
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://taolavh09_db_user:clhlySNpQIPgNhKwn6P3sKT5q3ulyNIS@dpg-da4q5u3bc2fs73c042ug-a/taolavh09_db").strip()
+# Production database configuration.
+# Never hard-code PostgreSQL credentials in source code. Render injects
+# DATABASE_URL from the PostgreSQL database defined in render.yaml.
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+REQUIRE_POSTGRES = os.getenv("REQUIRE_POSTGRES", "false").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 SQLITE_PATH = os.getenv("SQLITE_PATH", "/tmp/toolmowis.db")
-PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "https://taolavh09-3.onrender.com").rstrip("/")
+PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "https://taolavh10.onrender.com").rstrip("/")
 
 DEFAULT_PRICING = {
     "plans": {
@@ -43,35 +47,78 @@ def sql_conn():
 
 
 def init_db():
+    """Create the database schema before the server starts.
+
+    Render production uses PostgreSQL exclusively when REQUIRE_POSTGRES=true.
+    A short retry loop handles the case where the database is still becoming
+    available while the web service is starting.
+    """
+    if REQUIRE_POSTGRES and not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL is missing. Attach the Render PostgreSQL database "
+            "and expose its connectionString as DATABASE_URL."
+        )
+
     if DATABASE_URL:
-        con = pg()
-        cur = con.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS settings(
-            key TEXT PRIMARY KEY, value TEXT NOT NULL)""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS accounts(
-            id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL, assigned_key TEXT, max_devices INTEGER NOT NULL DEFAULT 1,
-            deleted BOOLEAN NOT NULL DEFAULT FALSE, created_at BIGINT NOT NULL)""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS keys(
-            key TEXT PRIMARY KEY, user_name TEXT, exp BIGINT NOT NULL,
-            max_devices INTEGER NOT NULL DEFAULT 1, devices TEXT NOT NULL DEFAULT '[]',
-            accounts TEXT NOT NULL DEFAULT '[]', deleted BOOLEAN NOT NULL DEFAULT FALSE,
-            created_at BIGINT NOT NULL)""")
-        con.commit(); cur.close(); con.close()
-    else:
-        con = sql_conn(); c = con.cursor()
-        c.execute("""CREATE TABLE IF NOT EXISTS settings(
-            key TEXT PRIMARY KEY, value TEXT NOT NULL)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS accounts(
-            id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL, assigned_key TEXT, max_devices INTEGER NOT NULL DEFAULT 1,
-            deleted INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS keys(
-            key TEXT PRIMARY KEY, user_name TEXT, exp INTEGER NOT NULL,
-            max_devices INTEGER NOT NULL DEFAULT 1, devices TEXT NOT NULL DEFAULT '[]',
-            accounts TEXT NOT NULL DEFAULT '[]', deleted INTEGER NOT NULL DEFAULT 0,
-            created_at INTEGER NOT NULL)""")
-        con.commit(); con.close()
+        last_error = None
+        for attempt in range(1, 6):
+            con = None
+            cur = None
+            try:
+                con = pg()
+                cur = con.cursor()
+                cur.execute("""CREATE TABLE IF NOT EXISTS settings(
+                    key TEXT PRIMARY KEY, value TEXT NOT NULL)""")
+                cur.execute("""CREATE TABLE IF NOT EXISTS accounts(
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL,
+                    password TEXT NOT NULL, assigned_key TEXT, max_devices INTEGER NOT NULL DEFAULT 1,
+                    deleted BOOLEAN NOT NULL DEFAULT FALSE, created_at BIGINT NOT NULL)""")
+                cur.execute("""CREATE TABLE IF NOT EXISTS keys(
+                    key TEXT PRIMARY KEY, user_name TEXT, exp BIGINT NOT NULL,
+                    max_devices INTEGER NOT NULL DEFAULT 1, devices TEXT NOT NULL DEFAULT '[]',
+                    accounts TEXT NOT NULL DEFAULT '[]', deleted BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at BIGINT NOT NULL)""")
+                con.commit()
+                return
+            except Exception as e:
+                last_error = e
+                if con:
+                    try:
+                        con.rollback()
+                    except Exception:
+                        pass
+                if attempt < 5:
+                    time.sleep(2)
+            finally:
+                if cur:
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
+                if con:
+                    try:
+                        con.close()
+                    except Exception:
+                        pass
+        raise RuntimeError(f"PostgreSQL initialization failed: {last_error}") from last_error
+
+    if REQUIRE_POSTGRES:
+        raise RuntimeError("PostgreSQL is required but DATABASE_URL is empty.")
+
+    # Local development fallback only. Render production sets REQUIRE_POSTGRES=true.
+    con = sql_conn(); c = con.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS settings(
+        key TEXT PRIMARY KEY, value TEXT NOT NULL)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS accounts(
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL, assigned_key TEXT, max_devices INTEGER NOT NULL DEFAULT 1,
+        deleted INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS keys(
+        key TEXT PRIMARY KEY, user_name TEXT, exp INTEGER NOT NULL,
+        max_devices INTEGER NOT NULL DEFAULT 1, devices TEXT NOT NULL DEFAULT '[]',
+        accounts TEXT NOT NULL DEFAULT '[]', deleted INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL)""")
+    con.commit(); c.close(); con.close()
 
 
 def setting_get(name, default):
