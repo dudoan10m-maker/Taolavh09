@@ -773,6 +773,91 @@ def wallet():
     if not acc: return jsonify({"ok":False,"error":"Không tìm thấy tài khoản"}),404
     bal=int(acc.get("balance") or 0); return jsonify({"ok":True,"success":True,"accountId":aid,"balance":bal,"walletBalance":bal})
 
+
+@app.post("/purchase-key")
+def purchase_key():
+    """Purchase a key with the account's server-side wallet balance.
+    Price/plan are validated server-side; balance deduction and key creation
+    happen in one transaction so the client cannot fake the price or spend twice.
+    """
+    d = request.get_json(silent=True) or {}
+    aid = str(d.get("accountId") or "").strip()
+    plan_key = str(d.get("planKey") or "90m-1").strip()
+    client_price = int(d.get("price") or 0) if str(d.get("price") or "0").isdigit() else 0
+    plans = {
+        "90m-1": {"label":"1TB", "price":20000, "devices":1, "durationMs":86400000},
+        "90m-2": {"label":"2TB", "price":38000, "devices":2, "durationMs":86400000},
+        "90m-3": {"label":"3TB", "price":59000, "devices":3, "durationMs":86400000},
+        "90m-4": {"label":"4TB", "price":77000, "devices":4, "durationMs":86400000},
+    }
+    plan = plans.get(plan_key)
+    if not aid:
+        return jsonify({"ok":False,"success":False,"error":"Thiếu accountId"}),400
+    if not plan:
+        return jsonify({"ok":False,"success":False,"error":"Gói mua không hợp lệ"}),400
+    # Never trust the price sent by the browser.
+    price = int(plan["price"])
+    if client_price and client_price != price:
+        return jsonify({"ok":False,"success":False,"error":"Giá gói không hợp lệ"}),400
+
+    try:
+        now = now_ms()
+        exp = now + int(plan["durationMs"])
+        key = "SHADOW-1DAY-" + secrets.token_hex(6).upper()
+        note = f"Mua {plan['label']} · 1 ngày · {plan['devices']} thiết bị"
+
+        if DATABASE_URL:
+            con = pg(); c = con.cursor()
+            try:
+                c.execute("SELECT * FROM accounts WHERE id=%s AND deleted=FALSE FOR UPDATE", (aid,))
+                row = c.fetchone()
+                if not row:
+                    con.rollback(); return jsonify({"ok":False,"success":False,"error":"Không tìm thấy tài khoản"}),404
+                cols=[x[0] for x in c.description]; acc=dict(zip(cols,row))
+                balance=int(acc.get("balance") or 0)
+                if balance < price:
+                    con.rollback()
+                    return jsonify({"ok":False,"success":False,"error":"Số dư không đủ. Vui lòng nạp thêm tiền.","balance":balance,"required":price}),400
+                c.execute("""INSERT INTO keys
+                    (key,user_name,exp,max_devices,devices,accounts,deleted,created_at)
+                    VALUES(%s,%s,%s,%s,'[]',%s,FALSE,%s)""",
+                    (key, acc["name"], exp, int(plan["devices"]), json.dumps([aid]), now))
+                c.execute("UPDATE accounts SET balance=balance-%s WHERE id=%s RETURNING balance", (price, aid))
+                new_balance=int(c.fetchone()[0])
+                con.commit()
+            finally:
+                c.close(); con.close()
+        else:
+            con=sql_conn()
+            try:
+                con.execute("BEGIN IMMEDIATE")
+                row=con.execute("SELECT * FROM accounts WHERE id=? AND deleted=0",(aid,)).fetchone()
+                if not row:
+                    con.rollback(); return jsonify({"ok":False,"success":False,"error":"Không tìm thấy tài khoản"}),404
+                acc=dict(row); balance=int(acc.get("balance") or 0)
+                if balance < price:
+                    con.rollback()
+                    return jsonify({"ok":False,"success":False,"error":"Số dư không đủ. Vui lòng nạp thêm tiền.","balance":balance,"required":price}),400
+                con.execute("""INSERT INTO keys
+                    (key,user_name,exp,max_devices,devices,accounts,deleted,created_at)
+                    VALUES(?,?,?,?, '[]',?,0,?)""",
+                    (key,acc["name"],exp,int(plan["devices"]),json.dumps([aid]),now))
+                con.execute("UPDATE accounts SET balance=balance-? WHERE id=?",(price,aid))
+                new_balance=int(con.execute("SELECT balance FROM accounts WHERE id=?",(aid,)).fetchone()["balance"])
+                con.commit()
+            finally:
+                con.close()
+
+        return jsonify({
+            "ok":True,"success":True,"key":key,"keyData":{"key":key},
+            "accountId":aid,"orderId":"BUY-"+secrets.token_hex(7).upper(),
+            "plan":plan["label"],"planKey":plan_key,"price":price,
+            "balance":new_balance,"exp":exp,"devices":plan["devices"],"note":note
+        })
+    except Exception as e:
+        return jsonify({"ok":False,"success":False,"error":str(e)}),500
+
+
 @app.get("/pricing")
 def get_pricing():
     return jsonify(setting_get("pricing",DEFAULT_PRICING))
