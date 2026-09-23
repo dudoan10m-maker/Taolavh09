@@ -73,6 +73,11 @@ def init_db():
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL,
                     password TEXT NOT NULL, assigned_key TEXT, max_devices INTEGER NOT NULL DEFAULT 1,
                     deleted BOOLEAN NOT NULL DEFAULT FALSE, created_at BIGINT NOT NULL)""")
+                cur.execute("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS balance BIGINT NOT NULL DEFAULT 0")
+                cur.execute("""CREATE TABLE IF NOT EXISTS deposits(
+                    id TEXT PRIMARY KEY, account_id TEXT NOT NULL, amount BIGINT NOT NULL,
+                    content TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending',
+                    created_at BIGINT NOT NULL, approved_at BIGINT, rejected_at BIGINT)""")
                 cur.execute("""CREATE TABLE IF NOT EXISTS keys(
                     key TEXT PRIMARY KEY, user_name TEXT, exp BIGINT NOT NULL,
                     max_devices INTEGER NOT NULL DEFAULT 1, devices TEXT NOT NULL DEFAULT '[]',
@@ -113,6 +118,13 @@ def init_db():
         id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL,
         password TEXT NOT NULL, assigned_key TEXT, max_devices INTEGER NOT NULL DEFAULT 1,
         deleted INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)""")
+    cols = [r[1] for r in c.execute("PRAGMA table_info(accounts)").fetchall()]
+    if "balance" not in cols:
+        c.execute("ALTER TABLE accounts ADD COLUMN balance INTEGER NOT NULL DEFAULT 0")
+    c.execute("""CREATE TABLE IF NOT EXISTS deposits(
+        id TEXT PRIMARY KEY, account_id TEXT NOT NULL, amount INTEGER NOT NULL,
+        content TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending',
+        created_at INTEGER NOT NULL, approved_at INTEGER, rejected_at INTEGER)""")
     c.execute("""CREATE TABLE IF NOT EXISTS keys(
         key TEXT PRIMARY KEY, user_name TEXT, exp INTEGER NOT NULL,
         max_devices INTEGER NOT NULL DEFAULT 1, devices TEXT NOT NULL DEFAULT '[]',
@@ -157,6 +169,7 @@ def account_json(row):
         "id": r["id"], "name": r["name"], "email": r["email"],
         "password": r["password"], "assignedKey": r.get("assigned_key"),
         "maxDevices": int(r.get("max_devices") or 1),
+        "balance": int(r.get("balance") or 0),
         "createdAt": int(r["created_at"])
     }
 
@@ -563,6 +576,202 @@ def verify_key():
     return jsonify({"valid":True,"devicesUsed":len(devices),"maxDevices":maxd,
                     "deviceCount":len(devices),"devices":devices,"key":k})
 
+
+# ---------------- WALLET / DEPOSIT ----------------
+def deposit_json(row):
+    if not row: return None
+    r=dict(row) if not isinstance(row,dict) else row
+    return {"id":str(r["id"]),"depositId":str(r["id"]),"orderId":str(r["id"]),
+            "accountId":str(r["account_id"]),"amount":int(r["amount"]),
+            "content":r.get("content") or "","status":r.get("status") or "pending",
+            "createdAt":int(r["created_at"]),"approvedAt":int(r["approved_at"]) if r.get("approved_at") else None,
+            "rejectedAt":int(r["rejected_at"]) if r.get("rejected_at") else None}
+
+def get_deposit(deposit_id):
+    if DATABASE_URL:
+        con=pg(); c=con.cursor(); c.execute("SELECT * FROM deposits WHERE id=%s",(deposit_id,)); row=c.fetchone()
+        cols=[d[0] for d in c.description] if row else []
+        c.close(); con.close(); return dict(zip(cols,row)) if row else None
+    con=sql_conn(); row=con.execute("SELECT * FROM deposits WHERE id=?",(deposit_id,)).fetchone(); con.close()
+    return dict(row) if row else None
+
+@app.post("/create-deposit")
+def create_deposit():
+    d=request.get_json(silent=True) or {}; aid=str(d.get("accountId") or d.get("account_id") or "").strip()
+    content=str(d.get("content") or d.get("transferContent") or "").strip()
+    try: amount=int(d.get("amount") or 0)
+    except Exception: amount=0
+    if not aid or amount<=0: return jsonify({"ok":False,"success":False,"error":"Thiếu accountId hoặc số tiền không hợp lệ"}),400
+    if not get_account_by_id(aid): return jsonify({"ok":False,"success":False,"error":"Không tìm thấy tài khoản"}),404
+    did=str(d.get("depositId") or d.get("orderId") or ("DEP-"+secrets.token_hex(8).upper())); created=now_ms()
+    if DATABASE_URL:
+        con=pg(); c=con.cursor()
+        try:
+            c.execute("""INSERT INTO deposits(id,account_id,amount,content,status,created_at) VALUES(%s,%s,%s,%s,'pending',%s) ON CONFLICT(id) DO NOTHING""",(did,aid,amount,content,created))
+            c.execute("SELECT * FROM deposits WHERE id=%s",(did,)); row=c.fetchone(); cols=[x[0] for x in c.description]; con.commit()
+        finally: c.close(); con.close()
+        return jsonify({"ok":True,"success":True,"deposit":deposit_json(dict(zip(cols,row)))})
+    con=sql_conn()
+    try:
+        con.execute("INSERT OR IGNORE INTO deposits(id,account_id,amount,content,status,created_at) VALUES(?,?,?,?,?,?)",(did,aid,amount,content,"pending",created))
+        row=con.execute("SELECT * FROM deposits WHERE id=?",(did,)).fetchone(); con.commit()
+    finally: con.close()
+    return jsonify({"ok":True,"success":True,"deposit":deposit_json(dict(row))})
+
+@app.get("/deposits")
+def deposits_list():
+    status=str(request.args.get("status","pending")).strip().lower()
+    if status not in {"","pending","completed","rejected"}: return jsonify({"ok":False,"error":"status không hợp lệ"}),400
+    if DATABASE_URL:
+        con=pg(); c=con.cursor()
+        try:
+            q="""SELECT d.*,a.name account_name,a.email account_email,COALESCE(a.balance,0) account_balance FROM deposits d LEFT JOIN accounts a ON a.id=d.account_id"""
+            if status: q+=" WHERE d.status=%s"; c.execute(q+" ORDER BY d.created_at DESC",(status,))
+            else: c.execute(q+" ORDER BY d.created_at DESC")
+            rows=c.fetchall(); cols=[x[0] for x in c.description]
+        finally: c.close(); con.close()
+        arr=[]
+        for row in rows:
+            r=dict(zip(cols,row)); x=deposit_json(r); x.update({"accountName":r.get("account_name") or "","accountEmail":r.get("account_email") or "","accountBalance":int(r.get("account_balance") or 0)}); arr.append(x)
+    else:
+        con=sql_conn()
+        try:
+            q="""SELECT d.*,a.name account_name,a.email account_email,COALESCE(a.balance,0) account_balance FROM deposits d LEFT JOIN accounts a ON a.id=d.account_id"""
+            rows=con.execute(q+(" WHERE d.status=?" if status else "")+" ORDER BY d.created_at DESC",((status,) if status else ())).fetchall()
+        finally: con.close()
+        arr=[]
+        for row in rows:
+            r=dict(row); x=deposit_json(r); x.update({"accountName":r.get("account_name") or "","accountEmail":r.get("account_email") or "","accountBalance":int(r.get("account_balance") or 0)}); arr.append(x)
+    return jsonify({"ok":True,"deposits":arr,"items":arr,"count":len(arr)})
+
+@app.post("/approve-deposit")
+def approve_deposit():
+    d=request.get_json(silent=True) or {}; did=str(d.get("depositId") or d.get("orderId") or d.get("id") or "").strip()
+    try: amount_override=int(d.get("amount")) if d.get("amount") not in (None,"") else None
+    except Exception: return jsonify({"ok":False,"error":"Số tiền không hợp lệ"}),400
+    if not did: return jsonify({"ok":False,"error":"Thiếu depositId/orderId"}),400
+    try:
+        if DATABASE_URL:
+            con=pg(); c=con.cursor()
+            try:
+                c.execute("SELECT * FROM deposits WHERE id=%s FOR UPDATE",(did,)); row=c.fetchone()
+                if not row: con.rollback(); return jsonify({"ok":False,"error":"Không tìm thấy giao dịch"}),404
+                cols=[x[0] for x in c.description]; dep=dict(zip(cols,row))
+                if dep["status"]=="completed":
+                    c.execute("SELECT balance FROM accounts WHERE id=%s",(dep["account_id"],)); a=c.fetchone(); con.rollback()
+                    return jsonify({"ok":True,"success":True,"alreadyProcessed":True,"balance":int(a[0] or 0)})
+                if dep["status"]!="pending": con.rollback(); return jsonify({"ok":False,"error":"Giao dịch không còn chờ"}),409
+                amount=int(amount_override if amount_override is not None else dep["amount"])
+                if amount<=0: con.rollback(); return jsonify({"ok":False,"error":"Số tiền phải > 0"}),400
+                c.execute("UPDATE deposits SET amount=%s,status='completed',approved_at=%s WHERE id=%s",(amount,now_ms(),did))
+                c.execute("UPDATE accounts SET balance=COALESCE(balance,0)+%s WHERE id=%s AND deleted=FALSE RETURNING balance",(amount,dep["account_id"]))
+                a=c.fetchone()
+                if not a: con.rollback(); return jsonify({"ok":False,"error":"Tài khoản không tồn tại"}),404
+                con.commit(); balance=int(a[0] or 0)
+            finally: c.close(); con.close()
+        else:
+            con=sql_conn()
+            try:
+                con.execute("BEGIN IMMEDIATE"); row=con.execute("SELECT * FROM deposits WHERE id=?",(did,)).fetchone()
+                if not row: con.rollback(); return jsonify({"ok":False,"error":"Không tìm thấy giao dịch"}),404
+                dep=dict(row)
+                if dep["status"]=="completed":
+                    a=con.execute("SELECT balance FROM accounts WHERE id=?",(dep["account_id"],)).fetchone(); con.rollback(); return jsonify({"ok":True,"success":True,"alreadyProcessed":True,"balance":int(a["balance"] or 0)})
+                if dep["status"]!="pending": con.rollback(); return jsonify({"ok":False,"error":"Giao dịch không còn chờ"}),409
+                amount=int(amount_override if amount_override is not None else dep["amount"])
+                if amount<=0: con.rollback(); return jsonify({"ok":False,"error":"Số tiền phải > 0"}),400
+                con.execute("UPDATE deposits SET amount=?,status='completed',approved_at=? WHERE id=?",(amount,now_ms(),did))
+                cur=con.execute("UPDATE accounts SET balance=COALESCE(balance,0)+? WHERE id=? AND deleted=0",(amount,dep["account_id"]))
+                if cur.rowcount!=1: con.rollback(); return jsonify({"ok":False,"error":"Tài khoản không tồn tại"}),404
+                a=con.execute("SELECT balance FROM accounts WHERE id=?",(dep["account_id"],)).fetchone(); con.commit(); balance=int(a["balance"] or 0)
+            finally: con.close()
+        return jsonify({"ok":True,"success":True,"deposit":deposit_json(get_deposit(did)),"balance":balance})
+    except Exception as e: return jsonify({"ok":False,"error":str(e)}),500
+
+@app.post("/manual-deposit")
+def manual_deposit():
+    """Admin manually credits an account and records the credit as completed."""
+    d=request.get_json(silent=True) or {}
+    ident=str(d.get("account") or d.get("accountId") or d.get("email") or "").strip()
+    content=str(d.get("content") or "ADMIN MANUAL").strip()
+    try: amount=int(d.get("amount") or 0)
+    except Exception: amount=0
+    if not ident or amount<=0: return jsonify({"ok":False,"error":"Thiếu tài khoản hoặc số tiền không hợp lệ"}),400
+
+    # Resolve by account ID first, then email.
+    acc=get_account_by_id(ident)
+    if not acc:
+        if DATABASE_URL:
+            con=pg(); c=con.cursor()
+            try:
+                c.execute("SELECT * FROM accounts WHERE email=%s AND deleted=FALSE",(ident,)); row=c.fetchone()
+                cols=[x[0] for x in c.description] if row else []
+            finally: c.close(); con.close()
+            acc=dict(zip(cols,row)) if row else None
+        else:
+            con=sql_conn(); row=con.execute("SELECT * FROM accounts WHERE email=? AND deleted=0",(ident,)).fetchone(); con.close()
+            acc=dict(row) if row else None
+    if not acc: return jsonify({"ok":False,"error":"Không tìm thấy tài khoản"}),404
+
+    did="MANUAL-"+secrets.token_hex(7).upper(); created=now_ms()
+    try:
+        if DATABASE_URL:
+            con=pg(); c=con.cursor()
+            try:
+                c.execute("UPDATE accounts SET balance=COALESCE(balance,0)+%s WHERE id=%s AND deleted=FALSE RETURNING balance",(amount,acc["id"]))
+                row=c.fetchone()
+                if not row: con.rollback(); return jsonify({"ok":False,"error":"Tài khoản không tồn tại"}),404
+                balance=int(row[0] or 0)
+                c.execute("""INSERT INTO deposits(id,account_id,amount,content,status,created_at,approved_at)
+                             VALUES(%s,%s,%s,%s,'completed',%s,%s)""",(did,acc["id"],amount,content,created,created))
+                con.commit()
+            finally: c.close(); con.close()
+        else:
+            con=sql_conn()
+            try:
+                con.execute("BEGIN IMMEDIATE")
+                cur=con.execute("UPDATE accounts SET balance=COALESCE(balance,0)+? WHERE id=? AND deleted=0",(amount,acc["id"]))
+                if cur.rowcount!=1: con.rollback(); return jsonify({"ok":False,"error":"Tài khoản không tồn tại"}),404
+                row=con.execute("SELECT balance FROM accounts WHERE id=?",(acc["id"],)).fetchone(); balance=int(row["balance"] or 0)
+                con.execute("""INSERT INTO deposits(id,account_id,amount,content,status,created_at,approved_at)
+                              VALUES(?,?,?,?,?, ?, ?)""",(did,acc["id"],amount,content,"completed",created,created))
+                con.commit()
+            finally: con.close()
+        return jsonify({"ok":True,"success":True,"depositId":did,"accountId":acc["id"],"amount":amount,"balance":balance})
+    except Exception as e:
+        return jsonify({"ok":False,"error":str(e)}),500
+
+@app.post("/reject-deposit")
+def reject_deposit():
+    d=request.get_json(silent=True) or {}; did=str(d.get("depositId") or d.get("orderId") or d.get("id") or "").strip()
+    if not did: return jsonify({"ok":False,"error":"Thiếu depositId/orderId"}),400
+    if DATABASE_URL:
+        con=pg(); c=con.cursor()
+        try:
+            c.execute("UPDATE deposits SET status='rejected',rejected_at=%s WHERE id=%s AND status='pending' RETURNING id",(now_ms(),did)); ok=c.fetchone(); con.commit()
+        finally: c.close(); con.close()
+    else:
+        con=sql_conn()
+        try: cur=con.execute("UPDATE deposits SET status='rejected',rejected_at=? WHERE id=? AND status='pending'",(now_ms(),did)); con.commit(); ok=cur.rowcount==1
+        finally: con.close()
+    if not ok: return jsonify({"ok":False,"error":"Không tìm thấy giao dịch chờ duyệt"}),404
+    return jsonify({"ok":True,"success":True,"deposit":deposit_json(get_deposit(did))})
+
+@app.get("/deposit-status")
+def deposit_status():
+    did=str(request.args.get("orderId") or request.args.get("depositId") or "").strip(); aid=str(request.args.get("accountId") or "").strip()
+    dep=get_deposit(did) if did else None
+    if not dep: return jsonify({"ok":False,"success":False,"status":"not_found"}),404
+    if aid and str(dep["account_id"])!=aid: return jsonify({"ok":False,"success":False,"error":"Không khớp tài khoản"}),403
+    out={"ok":True,"success":dep["status"]=="completed","status":dep["status"],"deposit":deposit_json(dep)}
+    if dep["status"]=="completed": out["amount"]=int(dep["amount"]); out["balance"]=int((get_account_by_id(str(dep["account_id"])) or {}).get("balance") or 0)
+    return jsonify(out)
+
+@app.get("/wallet")
+def wallet():
+    aid=str(request.args.get("accountId") or request.args.get("id") or "").strip(); acc=get_account_by_id(aid) if aid else None
+    if not acc: return jsonify({"ok":False,"error":"Không tìm thấy tài khoản"}),404
+    bal=int(acc.get("balance") or 0); return jsonify({"ok":True,"success":True,"accountId":aid,"balance":bal,"walletBalance":bal})
 
 @app.get("/pricing")
 def get_pricing():
