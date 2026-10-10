@@ -1,4 +1,4 @@
-import os, json, time, secrets, sqlite3
+import os, json, time, secrets, sqlite3, re
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -30,6 +30,19 @@ DEFAULT_STATUS = {"locked": False, "message": ""}
 
 def now_ms():
     return int(time.time() * 1000)
+
+
+# Chỉ chấp nhận mẫu key mới Tool267-; key SHADOW-/SUNWIN- cũ bị từ chối.
+_TOOL267_KEY_RE = re.compile(
+    r"^TOOL267-(?:VINHVIEN|\d+(?:MIN|GIO|H|DAY|D|DY))-[A-Z0-9]{4,}$",
+    re.IGNORECASE,
+)
+
+
+def normalize_tool267_key(value):
+    """Trả về key Tool267 chuẩn hoá; None nếu không đúng mẫu mới."""
+    key = str(value or "").strip().replace(" ", "").upper()
+    return key if _TOOL267_KEY_RE.fullmatch(key) else None
 
 
 def pg():
@@ -350,8 +363,10 @@ def delete_account():
 @app.post("/create-key")
 def create_key():
     d = request.get_json(silent=True) or {}
-    k = str(d.get("key", "")).strip()
+    k = normalize_tool267_key(d.get("key", ""))
     user = str(d.get("user", "") or "")
+    if not k:
+        return jsonify({"ok": False, "error": "Key không đúng mẫu mới Tool267-...; key SHADOW- cũ không được chấp nhận"}), 400
     try:
         exp = int(d.get("exp") or 0)
         maxd = max(1, min(3, int(d.get("maxDevices") or 1)))
@@ -432,7 +447,9 @@ def delete_key():
 def assign_key():
     d = request.get_json(silent=True) or {}
     aid = str(d.get("accountId", "")).strip()
-    k = str(d.get("key", "")).strip()
+    k = normalize_tool267_key(d.get("key", ""))
+    if not k:
+        return jsonify({"ok": False, "error": "Key không đúng mẫu mới Tool267-...; key SHADOW- cũ không được chấp nhận"}), 400
 
     try:
         exp = int(d.get("exp") or 0)
@@ -569,8 +586,10 @@ def client_ip():
 @app.post("/verify-key")
 def verify_key():
     d=request.get_json(silent=True) or {}
-    k=str(d.get("key","")).strip()
+    k=normalize_tool267_key(d.get("key", ""))
     aid=str(d.get("accountId") or d.get("account_id") or "").strip()
+    if not k:
+        return jsonify({"valid":False,"error":"Key không đúng mẫu mới Tool267-; key cũ không được nhận diện"}), 200
     ip=client_ip()  # thiết bị = IP, không tin device do client gửi lên
     if not k: return jsonify({"valid":False,"error":"Thiếu key"}),400
     if not ip: return jsonify({"valid":False,"error":"Không xác định được IP"}),400
@@ -862,8 +881,8 @@ def purchase_key():
         now = now_ms()
         # exp=0 is the existing backend convention for a non-expiring key.
         exp = 0 if int(plan["durationMs"]) == 0 else now + int(plan["durationMs"])
-        key_prefix = "SHADOW-LIFE-" if exp == 0 else "SHADOW-KEY-"
-        key = key_prefix + secrets.token_hex(6).upper()
+        key_label = "VINHVIEN" if exp == 0 else ("4DAY" if plan_key in ("90m-1", "90m-2") else "10DAY")
+        key = f"TOOL267-{key_label}-{secrets.token_hex(6).upper()}"
         duration_note = "vĩnh viễn" if exp == 0 else ("4 ngày" if plan_key in ("90m-1", "90m-2") else "10 ngày")
         note = f"Mua {plan['label']} · {duration_note} · {plan['devices']} thiết bị"
 
