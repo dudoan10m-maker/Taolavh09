@@ -98,6 +98,9 @@ def init_db():
                     max_devices INTEGER NOT NULL DEFAULT 1, devices TEXT NOT NULL DEFAULT '[]',
                     accounts TEXT NOT NULL DEFAULT '[]', deleted BOOLEAN NOT NULL DEFAULT FALSE,
                     created_at BIGINT NOT NULL)""")
+                cur.execute("""CREATE TABLE IF NOT EXISTS account_presence(
+                    account_id TEXT PRIMARY KEY, last_seen BIGINT NOT NULL,
+                    online BOOLEAN NOT NULL DEFAULT TRUE)""")
                 con.commit()
                 return
             except Exception as e:
@@ -145,6 +148,9 @@ def init_db():
         max_devices INTEGER NOT NULL DEFAULT 1, devices TEXT NOT NULL DEFAULT '[]',
         accounts TEXT NOT NULL DEFAULT '[]', deleted INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS account_presence(
+        account_id TEXT PRIMARY KEY, last_seen INTEGER NOT NULL,
+        online INTEGER NOT NULL DEFAULT 1)""")
     con.commit(); c.close(); con.close()
 
 
@@ -316,6 +322,69 @@ def accounts():
         con=sql_conn(); rows=con.execute("SELECT * FROM accounts WHERE deleted=0 ORDER BY created_at DESC").fetchall(); con.close()
         arr=[account_json(dict(r)) for r in rows]
     return jsonify({"accounts":arr})
+
+
+@app.post("/api/heartbeat")
+def account_heartbeat():
+    """Record active tool presence; clients should ping every 20 seconds."""
+    d = request.get_json(silent=True) or {}
+    aid = str(d.get("accountId") or d.get("account_id") or "").strip()
+    online = bool(d.get("online", True))
+    if not aid:
+        return jsonify({"ok": False, "error": "Thiếu accountId"}), 400
+    ts = now_ms()
+    try:
+        if DATABASE_URL:
+            con = pg(); c = con.cursor()
+            try:
+                c.execute("SELECT id FROM accounts WHERE id=%s AND deleted=FALSE", (aid,))
+                if not c.fetchone():
+                    return jsonify({"ok": False, "error": "Không tìm thấy tài khoản"}), 404
+                c.execute("""INSERT INTO account_presence(account_id,last_seen,online)
+                    VALUES(%s,%s,%s) ON CONFLICT(account_id) DO UPDATE SET
+                    last_seen=EXCLUDED.last_seen, online=EXCLUDED.online""", (aid, ts, online))
+                con.commit()
+            finally:
+                c.close(); con.close()
+        else:
+            con = sql_conn()
+            try:
+                if not con.execute("SELECT id FROM accounts WHERE id=? AND deleted=0", (aid,)).fetchone():
+                    return jsonify({"ok": False, "error": "Không tìm thấy tài khoản"}), 404
+                con.execute("""INSERT INTO account_presence(account_id,last_seen,online)
+                    VALUES(?,?,?) ON CONFLICT(account_id) DO UPDATE SET
+                    last_seen=excluded.last_seen, online=excluded.online""", (aid, ts, int(online)))
+                con.commit()
+            finally:
+                con.close()
+        return jsonify({"ok": True, "accountId": aid, "online": online, "lastSeen": ts})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/api/sessions")
+def account_sessions():
+    """Return live account states. A heartbeat older than 75 seconds is offline."""
+    cutoff = now_ms() - 75000
+    try:
+        if DATABASE_URL:
+            con = pg(); c = con.cursor()
+            c.execute("""SELECT p.account_id, p.last_seen, p.online, a.name, a.email
+                FROM account_presence p JOIN accounts a ON a.id=p.account_id
+                WHERE a.deleted=FALSE""")
+            rows = c.fetchall(); c.close(); con.close()
+            rows = [{"accountId":r[0], "lastSeen":int(r[1]), "online":bool(r[2]) and int(r[1]) >= cutoff,
+                     "name":r[3], "email":r[4]} for r in rows]
+        else:
+            con = sql_conn()
+            rows0 = con.execute("""SELECT p.account_id, p.last_seen, p.online, a.name, a.email
+                FROM account_presence p JOIN accounts a ON a.id=p.account_id
+                WHERE a.deleted=0""").fetchall(); con.close()
+            rows = [{"accountId":r[0], "lastSeen":int(r[1]), "online":bool(r[2]) and int(r[1]) >= cutoff,
+                     "name":r[3], "email":r[4]} for r in rows0]
+        return jsonify({"ok": True, "sessions": rows, "serverTime": now_ms()})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "sessions": []}), 500
 
 
 @app.get("/my-account")
@@ -1063,6 +1132,7 @@ def api_info():
     return jsonify({"ok":True,"apiBase":PUBLIC_API_URL,"endpoints":[
         "/", "/health", "/register", "/login", "/accounts", "/delete-account",
         "/create-key", "/keys", "/delete-key", "/assign-key", "/my-account", "/verify-key",
+        "/api/heartbeat", "/api/sessions",
         "/pricing", "/api/status", "/bank-config", "/api/game-config", "/inbox"
     ]})
 
