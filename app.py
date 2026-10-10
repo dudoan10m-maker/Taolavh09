@@ -17,10 +17,12 @@ PUBLIC_API_URL = os.getenv("PUBLIC_API_URL", "https://taolavh10.onrender.com").r
 
 DEFAULT_PRICING = {
     "plans": {
-        "1": {"base": 33000, "sale": 0, "saleExpiry": None},
-        "2": {"base": 41000, "sale": 0, "saleExpiry": None},
-        "3": {"base": 53000, "sale": 0, "saleExpiry": None},
+        "1": {"base": 20000, "sale": 0, "saleExpiry": None},
+        "2": {"base": 38000, "sale": 0, "saleExpiry": None},
+        "3": {"base": 59000, "sale": 0, "saleExpiry": None},
+        "4": {"base": 77000, "sale": 0, "saleExpiry": None},
     },
+    "lifetimePlans": {"1": 150000, "2": 200000, "4": 450000},
     "saleEnabled": False,
 }
 DEFAULT_STATUS = {"locked": False, "message": ""}
@@ -776,35 +778,55 @@ def wallet():
 
 @app.post("/purchase-key")
 def purchase_key():
-    """Purchase a key with the account's server-side wallet balance.
-    Price/plan are validated server-side; balance deduction and key creation
-    happen in one transaction so the client cannot fake the price or spend twice.
-    """
+    """Purchase a key using server-authoritative plan duration and pricing."""
     d = request.get_json(silent=True) or {}
     aid = str(d.get("accountId") or "").strip()
     plan_key = str(d.get("planKey") or "90m-1").strip()
     client_price = int(d.get("price") or 0) if str(d.get("price") or "0").isdigit() else 0
-    plans = {
-        "90m-1": {"label":"1TB", "price":20000, "devices":1, "durationMs":86400000},
-        "90m-2": {"label":"2TB", "price":38000, "devices":2, "durationMs":86400000},
-        "90m-3": {"label":"3TB", "price":59000, "devices":3, "durationMs":86400000},
-        "90m-4": {"label":"4TB", "price":77000, "devices":4, "durationMs":86400000},
+
+    # Durations are enforced on the server; never use a browser-supplied expiry.
+    plan_specs = {
+        "90m-1": {"label":"1TB", "devices":1, "durationMs":4 * 24 * 60 * 60 * 1000, "priceKey":"1"},
+        "90m-2": {"label":"2TB", "devices":2, "durationMs":4 * 24 * 60 * 60 * 1000, "priceKey":"2"},
+        "90m-3": {"label":"3TB", "devices":3, "durationMs":10 * 24 * 60 * 60 * 1000, "priceKey":"3"},
+        "90m-4": {"label":"4TB", "devices":4, "durationMs":10 * 24 * 60 * 60 * 1000, "priceKey":"4"},
+        "life-1": {"label":"Vĩnh viễn 1TB", "devices":1, "durationMs":0, "priceKey":"life-1"},
+        "life-2": {"label":"Vĩnh viễn 2TB", "devices":2, "durationMs":0, "priceKey":"life-2"},
+        "life-4": {"label":"Vĩnh viễn 4TB", "devices":4, "durationMs":0, "priceKey":"life-4"},
     }
-    plan = plans.get(plan_key)
+    spec = plan_specs.get(plan_key)
     if not aid:
         return jsonify({"ok":False,"success":False,"error":"Thiếu accountId"}),400
-    if not plan:
+    if not spec:
         return jsonify({"ok":False,"success":False,"error":"Gói mua không hợp lệ"}),400
-    # Never trust the price sent by the browser.
-    price = int(plan["price"])
-    if client_price and client_price != price:
-        return jsonify({"ok":False,"success":False,"error":"Giá gói không hợp lệ"}),400
 
+    pricing = setting_get("pricing", DEFAULT_PRICING) or DEFAULT_PRICING
+    pricing_plans = pricing.get("plans") or {}
+    life_prices = pricing.get("lifetimePlans") or DEFAULT_PRICING["lifetimePlans"]
+    if plan_key.startswith("life-"):
+        size = plan_key.split("-")[-1]
+        price = int(life_prices.get(size, DEFAULT_PRICING["lifetimePlans"].get(size, 0)))
+    else:
+        p = pricing_plans.get(spec["priceKey"], {}) or {}
+        base = int(p.get("base", DEFAULT_PRICING["plans"][spec["priceKey"]]["base"]))
+        sale = int(p.get("sale", 0) or 0)
+        sale_expiry = p.get("saleExpiry")
+        sale_is_current = sale > 0 and sale < base and (not sale_expiry or now_ms() < int(sale_expiry))
+        price = sale if sale_is_current else base
+    if price <= 0:
+        return jsonify({"ok":False,"success":False,"error":"Giá gói chưa được cấu hình hợp lệ"}),500
+    if client_price and client_price != price:
+        return jsonify({"ok":False,"success":False,"error":"Giá gói không hợp lệ; hãy tải lại giá mới.","expectedPrice":price}),400
+
+    plan = {**spec, "price": price}
     try:
         now = now_ms()
-        exp = now + int(plan["durationMs"])
-        key = "SHADOW-1DAY-" + secrets.token_hex(6).upper()
-        note = f"Mua {plan['label']} · 1 ngày · {plan['devices']} thiết bị"
+        # exp=0 is the existing backend convention for a non-expiring key.
+        exp = 0 if int(plan["durationMs"]) == 0 else now + int(plan["durationMs"])
+        key_prefix = "SHADOW-LIFE-" if exp == 0 else "SHADOW-KEY-"
+        key = key_prefix + secrets.token_hex(6).upper()
+        duration_note = "vĩnh viễn" if exp == 0 else ("4 ngày" if plan_key in ("90m-1", "90m-2") else "10 ngày")
+        note = f"Mua {plan['label']} · {duration_note} · {plan['devices']} thiết bị"
 
         if DATABASE_URL:
             con = pg(); c = con.cursor()
@@ -852,7 +874,8 @@ def purchase_key():
             "ok":True,"success":True,"key":key,"keyData":{"key":key},
             "accountId":aid,"orderId":"BUY-"+secrets.token_hex(7).upper(),
             "plan":plan["label"],"planKey":plan_key,"price":price,
-            "balance":new_balance,"exp":exp,"devices":plan["devices"],"note":note
+            "balance":new_balance,"exp":exp,"devices":plan["devices"],
+            "durationMs":plan["durationMs"],"durationLabel":duration_note,"note":note
         })
     except Exception as e:
         return jsonify({"ok":False,"success":False,"error":str(e)}),500
@@ -866,22 +889,31 @@ def get_pricing():
 @app.post("/pricing")
 def set_pricing():
     d=request.get_json(silent=True) or {}
-    cur=setting_get("pricing",DEFAULT_PRICING)
+    cur=setting_get("pricing",DEFAULT_PRICING) or json.loads(json.dumps(DEFAULT_PRICING))
+    cur.setdefault("plans", {})
+    for n in ("1","2","3","4"):
+        cur["plans"].setdefault(n, dict(DEFAULT_PRICING["plans"][n]))
     plans=d.get("plans") or d.get("pricingByDevices") or {}
-    for n in ("1","2","3"):
+    for n in ("1","2","3","4"):
         x=plans.get(n) or plans.get(int(n)) or {}
         if x:
             cur["plans"][n]={
-                "base":int(x.get("base",cur["plans"][n]["base"])),
+                "base":int(x.get("base",cur["plans"][n].get("base",DEFAULT_PRICING["plans"][n]["base"]))),
                 "sale":int(x.get("sale",cur["plans"][n].get("sale",0))),
                 "saleExpiry":x.get("saleExpiry",cur["plans"][n].get("saleExpiry"))
             }
+    life=d.get("lifetimePlans") or cur.get("lifetimePlans") or DEFAULT_PRICING["lifetimePlans"]
+    cur["lifetimePlans"]={
+        "1":int(life.get("1",life.get(1,150000))),
+        "2":int(life.get("2",life.get(2,200000))),
+        "4":int(life.get("4",life.get(4,450000)))
+    }
     cur["saleEnabled"]=bool(d.get("saleEnabled",cur.get("saleEnabled",False)))
     setting_set("pricing",cur)
-    saved = setting_get("pricing", None)
+    saved=setting_get("pricing",None)
     if saved != cur:
-        return jsonify({"ok":False,"error":"SALE chưa được lưu/xác minh trên server"}),500
-    return jsonify({"ok":True, **saved})
+        return jsonify({"ok":False,"error":"Giá chưa được lưu/xác minh trên server"}),500
+    return jsonify({"ok":True,**saved})
 
 
 @app.get("/bank-config")
