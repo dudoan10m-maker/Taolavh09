@@ -508,10 +508,12 @@ def assign_key():
 
                 acc = dict(row)
                 now = now_ms()
+                old = con.execute("SELECT devices FROM keys WHERE key=?", (k,)).fetchone()
+                keep_dev = old["devices"] if old and old["devices"] else "[]"
                 con.execute("""INSERT OR REPLACE INTO keys
                     (key,user_name,exp,max_devices,devices,accounts,deleted,created_at)
-                    VALUES(?,?,?,?, '[]',?,0,?)""",
-                    (k, acc["name"], exp, maxd, json.dumps([aid]), now))
+                    VALUES(?,?,?,?,?,?,0,?)""",
+                    (k, acc["name"], exp, maxd, keep_dev, json.dumps([aid]), now))
                 con.execute(
                     "UPDATE accounts SET assigned_key=?,max_devices=? WHERE id=?",
                     (k, maxd, aid)
@@ -554,29 +556,66 @@ def assign_key():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+def client_ip():
+    """IP thật của thiết bị (Render/Cloudflare đứng sau proxy)."""
+    for h in ("CF-Connecting-IP", "X-Real-IP"):
+        v = request.headers.get(h, "").strip()
+        if v: return v
+    xff = request.headers.get("X-Forwarded-For", "")
+    if xff: return xff.split(",")[0].strip()
+    return request.remote_addr or ""
+
+
 @app.post("/verify-key")
 def verify_key():
     d=request.get_json(silent=True) or {}
-    k=str(d.get("key","")).strip(); device=str(d.get("device","")).strip()
-    row=get_key(k)
-    if not row: return jsonify({"valid":False,"error":"Key không tồn tại"}),404
+    k=str(d.get("key","")).strip()
+    aid=str(d.get("accountId") or d.get("account_id") or "").strip()
+    ip=client_ip()  # thiết bị = IP, không tin device do client gửi lên
+    if not k: return jsonify({"valid":False,"error":"Thiếu key"}),400
+    if not ip: return jsonify({"valid":False,"error":"Không xác định được IP"}),400
+
+    if DATABASE_URL:
+        con=pg(); c=con.cursor()
+        c.execute("SELECT * FROM keys WHERE key=%s AND deleted=FALSE FOR UPDATE",(k,))
+        r=c.fetchone(); cols=[x[0] for x in c.description] if r else []
+        row=dict(zip(cols,r)) if r else None
+    else:
+        con=sql_conn(); c=None
+        r=con.execute("SELECT * FROM keys WHERE key=? AND deleted=0",(k,)).fetchone()
+        row=dict(r) if r else None
+
+    def done(payload, code=200):
+        try:
+            if c: c.close()
+        finally:
+            con.close()
+        return jsonify(payload), code
+
+    if not row: return done({"valid":False,"error":"Key không tồn tại"},404)
     exp=int(row["exp"]); maxd=int(row.get("max_devices") or 1)
-    if exp and now_ms()>exp: return jsonify({"valid":False,"error":"Key đã hết hạn"})
+    if exp and now_ms()>exp: return done({"valid":False,"error":"Key đã hết hạn"})
+
     devices=json.loads(row.get("devices") or "[]")
     accounts=json.loads(row.get("accounts") or "[]")
-    if device and device not in devices:
+
+    # IP đã lưu cho key này -> không tính thêm, dù đăng nhập bằng tài khoản nào.
+    # Chỉ IP mới (thiết bị khác) mới chiếm thêm 1 slot.
+    if ip not in devices:
         if len(devices)>=maxd:
-            return jsonify({"valid":False,"error":"Đã đủ số thiết bị","devicesUsed":len(devices),"maxDevices":maxd})
-        devices.append(device)
-    # Device count is global per key: different accounts using the same key
-    # consume the same shared device slots.
+            return done({"valid":False,"error":"Đã đủ số thiết bị","devicesUsed":len(devices),"maxDevices":maxd})
+        devices.append(ip)
+    if aid and aid not in accounts:
+        accounts.append(aid)
+
     if DATABASE_URL:
-        con=pg(); c=con.cursor(); c.execute("UPDATE keys SET devices=%s WHERE key=%s",(json.dumps(devices),k))
-        con.commit(); c.close(); con.close()
+        c.execute("UPDATE keys SET devices=%s,accounts=%s WHERE key=%s",(json.dumps(devices),json.dumps(accounts),k))
+        con.commit()
     else:
-        con=sql_conn(); con.execute("UPDATE keys SET devices=? WHERE key=?",(json.dumps(devices),k)); con.commit(); con.close()
-    return jsonify({"valid":True,"devicesUsed":len(devices),"maxDevices":maxd,
-                    "deviceCount":len(devices),"devices":devices,"key":k})
+        con.execute("UPDATE keys SET devices=?,accounts=? WHERE key=?",(json.dumps(devices),json.dumps(accounts),k))
+        con.commit()
+    return done({"valid":True,"devicesUsed":len(devices),"maxDevices":maxd,
+                 "deviceCount":len(devices),"devices":devices,"key":k})
 
 
 # ---------------- WALLET / DEPOSIT ----------------
